@@ -28,7 +28,49 @@ PureScript gives us:
 - Newtypes for branded ids with no runtime cost.
 - A small core and a real module system. No `any`, no structural casts, no decorators.
 
-Iris is an implementation of PureScript. It compiles the same language, so a library built on these features works on Iris and on `purs`. The design does not depend on Iris-specific extensions. It does benefit from Iris's faster builds and language server, because row-heavy types are where compile times would otherwise hurt.
+Iris is a superset of PureScript. The type-level effect system is still PureScript's `Effect` and `Aff`. What Iris changes is code generation. An `Effect` is a zero-argument action, and Iris fuses `pure`, `bind`, `discard`, `map`, and `apply` for `Effect` and `ST`, preserving evaluation timing. That matters here because the domain kernel stays pure while the runtime boundary can use `Effect` or `ST` without paying for a tower of bind calls. If you meant a different effect system, I did not find one in the compiler. The monad is still `Effect` and `Aff`.
+
+The bigger language feature is deriving. Iris derives `Functor`, `Bifunctor`, `Contravariant`, `Profunctor`, `Foldable`, `Bifoldable`, `Traversable`, `Bitraversable`, `Eq1`, `Ord1`, `Generic`, and `Newtype`. PureScript 0.15.16 derives only `Eq`, `Ord`, `Functor`, `Generic`, and `Newtype`. This changes the library design. The boring instances disappear, and the library can ask for a `Traversable` or a `Profunctor` without making the user write it.
+
+Two examples show why this is not decoration.
+
+```purescript
+data Changes a = Changes
+  { version :: Int
+  , values :: Array a
+  }
+
+derive instance Functor Changes
+derive instance Foldable Changes
+derive instance Traversable Changes
+```
+
+`traverse` over a `Changes` batch lets a projection validate, encode, or enrich every event in one pass. The version stays fixed while the values move.
+
+```purescript
+newtype Codec a b = Codec
+  { encode :: a -> String
+  , decode :: String -> Either String b
+  }
+
+derive instance Profunctor Codec
+```
+
+A codec is a profunctor. `dimap` adapts a codec between a domain type and a wire type. That is the useful part, not a slogan.
+
+```purescript
+newtype Predicate a = Predicate (a -> Boolean)
+
+derive instance Contravariant Predicate
+```
+
+`cmap` adapts a permission check to a richer record. Compose predicates with a `Semigroup` instance for `&&`. That is the security boundary, and it is three lines.
+
+Iris also has virtual modules and compiler intrinsics. The `Iris.StyleX` modules are the working example. A domain library does not need an intrinsic, but the mechanism is there if a `Domain` module ever needs compiler support. The `iris watch query` server is useful for agents, and the module metadata is useful for bundlers.
+
+The practical rule: use Iris deriving for structural boilerplate, but keep the domain API in ordinary PureScript so it runs on both compilers. The exception is a module that explicitly targets Iris, such as an Iris-only `Codec` newtype that derives `Profunctor`.
+
+These examples compile with Iris 0.1.13. The bank prototype also builds and passes its stories under both `purs` 0.15.16 and Iris 0.1.13. Keep the output directories separate. The two compilers generate different JavaScript, and mixing the trees produces confusing runtime errors.
 
 ## The core shape
 
@@ -54,16 +96,23 @@ The law to test is the monoid homomorphism:
 replay evolve (xs <> ys) s == replay evolve ys (replay evolve xs s)
 ```
 
-A view is the same fold with a key:
+The common shape behind a view, a projection, and a saga is one step:
+
+```purescript
+type Step s i o = s -> i -> Tuple s (Array o)
+```
+
+A view is a keyed step:
 
 ```purescript
 type View k s e out =
   { initial :: s
   , keyOf :: Envelope e -> Maybe k
-  , evolve :: s -> Envelope e -> s
-  , emit :: Envelope e -> Array out
+  , step :: Step s (Envelope e) out
   }
 ```
+
+This is deliberately one function, not an `evolve` and an `emit`. The next state and the emitted values can depend on each other, which is what a real view needs.
 
 A policy is a Kleisli arrow from events to commands:
 
@@ -75,10 +124,10 @@ type Policy e c =
 A saga is a stateful policy:
 
 ```purescript
-type Process s e c k =
+type Process k s e c =
   { initial :: s
   , keyOf :: Envelope e -> Maybe k
-  , step :: s -> Envelope e -> Tuple s (Array (CommandEnvelope c))
+  , step :: Step s (Envelope e) (CommandEnvelope c)
   }
 ```
 
@@ -222,13 +271,16 @@ summary :: View String Summary AccountEvent Unit
 summary =
   { initial: { owner: Nothing, balance: 0 }
   , keyOf: \envelope -> Just envelope.stream
-  , evolve: \state envelope -> match
-      { accountOpened: \event -> state { owner = Just event.owner }
-      , moneyDeposited: \event -> state { balance = event.balanceAfter }
-      , moneyWithdrawn: \event -> state { balance = event.balanceAfter }
-      }
-      envelope.event
-  , emit: \_ -> []
+  , step: \state envelope ->
+      Tuple
+        ( match
+            { accountOpened: \event -> state { owner = Just event.owner }
+            , moneyDeposited: \event -> state { balance = event.balanceAfter }
+            , moneyWithdrawn: \event -> state { balance = event.balanceAfter }
+            }
+            envelope.event
+        )
+        []
   }
 ```
 
@@ -239,15 +291,17 @@ statement :: View String Unit AccountEvent StatementLine
 statement =
   { initial: unit
   , keyOf: \envelope -> Just envelope.stream
-  , evolve: \_ _ -> unit
-  , emit: \envelope -> match
-      { accountOpened: \_ -> []
-      , moneyDeposited: \event ->
-          [ { kind: "deposit", amount: event.amount, balance: event.balanceAfter } ]
-      , moneyWithdrawn: \event ->
-          [ { kind: "withdrawal", amount: event.amount, balance: event.balanceAfter } ]
-      }
-      envelope.event
+  , step: \_ envelope ->
+      Tuple unit
+        ( match
+            { accountOpened: \_ -> []
+            , moneyDeposited: \event ->
+                [ { kind: "deposit", amount: event.amount, balance: event.balanceAfter } ]
+            , moneyWithdrawn: \event ->
+                [ { kind: "withdrawal", amount: event.amount, balance: event.balanceAfter } ]
+            }
+            envelope.event
+        )
   }
 ```
 
@@ -341,6 +395,35 @@ The pieces worth borrowing:
 
 The Haskell and TypeScript prior art is also worth reading. Alchemy and `fmodel-ts` in TypeScript, and `eventful` in Haskell, have already worked through the hard parts of command ids, at-least-once delivery, and projections. The PureScript version should steal those semantics, not reinvent them.
 
+## What I would steal from Haskell
+
+The Haskell ecosystem has already tried most of these shapes. The useful move is to take the idea and drop the ceremony.
+
+| Haskell idea | PureScript counterpart | What to use it for | What not to do |
+| --- | --- | --- | --- |
+| `free` / `freer-simple` | `purescript-run`, `purescript-free` | A command language with several interpreters: in-memory, durable, test, mock. | Do not make the domain user write `Free` by hand. The runtime can hide it. |
+| `profunctors` | `purescript-profunctor` | Codecs and optics. A codec is a profunctor; `dimap` adapts it to the wire. | Do not turn every function into a profunctor. Use it where composition pays. |
+| `recursion-schemes` | `purescript-matryoshka` | Replay, folds, and event trees if the history stops being a list. | Do not use a fixed-point type for a flat event log. A list is already a catamorphism. |
+| `singletons` | type-level symbols and rows | IDs, stream names, and command labels. | Do not encode the whole schema at the type level. The compiler is not a database. |
+| `generics-sop` | `purescript-generics-rep`, Iris deriving | JSON codecs, equality, traversal, and handlers. | Do not derive what a human should read. Keep the domain logic explicit. |
+| `servant` | `purescript-routing-duplex`, `httpure` | A typed API surface and path codecs. | Do not generate a client before the server works. |
+| `opaleye` / `hasql` | `purescript-selda` | Typed projections and read models. | Do not let the database schema drive the aggregate. |
+| `polysemy` / `fused-effects` | `purescript-run` or a capability record | Runtime effects, external systems, tracing. | Do not build an n-squared MTL stack. A record of capabilities is enough. |
+| `lens` | `purescript-profunctor-lenses` | Nested state, view validation, read-your-writes. | Do not use optics where a record update is clearer. |
+| `streamly` / `conduit` | `purescript-event`, `purescript-hyrule`, `purescript-avar` | `watch`, projections, and per-key queues. | Do not poll. Streams are the natural read side. |
+
+The pattern is consistent. Use the Haskell structure to understand the algebra, then expose the smallest PureScript API that keeps the law. The user should see `decide`, `evolve`, `step`, `send`, `view`, and `watch`. The user should not see `Free`, `Cofree`, `Day`, or `Profunctor` unless they ask for them.
+
+## Scalability notes
+
+The prototype is in memory and single-threaded. Three costs would bite in production.
+
+- `ViewState.emitted <> ...` is an array append per event, so a long statement view is O(n²). Use a sequence with O(1) append, or prepend and reverse at read time. Alchemy keeps an input log and pages it; do the same.
+- `Stream.history <> envelopes` is an array append per command, so replaying a long stream is O(n²). A real store appends to a log and loads a snapshot plus a tail.
+- Command receipts grow without bound. Keep a deduplication window or a TTL, and store the receipt with the command's timestamp.
+
+The concurrency story is the other half. One queue per stream, a bounded queue for backpressure, and a fiber per shard. `Aff` and `AVar` are enough to start. If the host is Cloudflare Durable Objects, the object is the queue and the single-writer boundary.
+
 ## What Alchemy has that this prototype does not
 
 The domain core is the easy part. The guarantees are the work.
@@ -399,6 +482,37 @@ view :: forall k. View k s e out -> k -> Aff s
 watch :: forall k. View k s e out -> k -> Event s
 ```
 
+The host boundary is a record of capabilities, not a monad transformer stack:
+
+```purescript
+type Store m =
+  { load :: StreamId -> m (Maybe Snapshot)
+  , append :: StreamId -> Version -> Array Event -> m Receipt
+  , watch :: StreamId -> Event (Envelope Event)
+  }
+
+type Runtime m =
+  { now :: m Instant
+  , store :: Store m
+  , publish :: Envelope Event -> m Unit
+  , trace :: Span -> m Unit
+  }
+```
+
+A `ReaderT Runtime Aff` is enough. The record makes dependencies explicit, keeps tests honest, and avoids the n-squared instances of an MTL stack. If the runtime needs a mock clock, a mock store, or a mock payment provider, you replace one field.
+
+The model is a record of components, and the `main` function is the wiring. I would not build a framework that owns a heterogeneous list of aggregates. PureScript can express that list, but the existentials and row plumbing cost more than they save. A record of named components plus a handful of interpreters is easier to read, easier to test, and easier to split into packages. The user's `Bank` record is the model. The library supplies the verbs.
+
+## What I would build first
+
+The prototype already has the kernel and the stories. The next three pieces are the ones that decide whether the library is a toy.
+
+1. **A runtime with command receipts.** `CommandId` is a branded newtype. The store maps `CommandId` to `Receipt`. A retry returns the stored receipt. This is the difference between a demo and a system that can survive a network.
+2. **A per-key actor.** Each stream has a queue and a fiber. Commands for one key run in order; different keys run in parallel. The type of the key is the aggregate id, so the routing is not stringly typed.
+3. **A codec layer.** Events and commands cross a boundary. `Codec a b` is a profunctor, and `dimap` adapts a wire codec to a domain codec. Iris can derive the instance. A `Generic`-based JSON codec handles the boring cases.
+
+After those, the API, projections, and observability are ordinary work. They matter, but they do not change the shape of the library.
+
 ## Status
 
 This repository is a working prototype, not a library.
@@ -411,6 +525,6 @@ This repository is a working prototype, not a library.
 - `src/Bank/Model.purs` has the in-memory world.
 - `test/Test/Main.purs` runs the Alchemy tutorial stories plus the replay law.
 
-`spago test` passes.
+`spago test` and `iris test` both pass when run separately. They write different JavaScript, so delete `output` before switching compilers.
 
 The next useful step is not more domain code. It is a runtime with per-key queues and command receipts, because that is where the Alchemy guarantees actually live.
