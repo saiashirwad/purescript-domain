@@ -1,17 +1,35 @@
 package:
   name: domain
   dependencies:
+    - aff
+    - argonaut-codecs
+    - argonaut-core
     - arrays
+    - avar
+    - catenable-lists
     - console
+    - datetime
     - effect
     - either
     - exceptions
     - foldable-traversable
+    - foreign-object
+    - integers
+    - js-date
+    - lists
     - maybe
+    - newtype
+    - node-http
     - ordered-collections
     - partial
     - prelude
+    - profunctor
+    - record
+    - refs
+    - routing-duplex
+    - strings
     - tuples
+    - unfoldable
     - variant
   test:
     main: Test.Main
@@ -19,7 +37,9 @@ package:
       - console
       - effect
       - exceptions
+      - gen
       - prelude
+      - quickcheck
 workspace:
   packageSet:
     registry: 81.11.0

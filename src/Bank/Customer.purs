@@ -8,6 +8,7 @@ module Bank.Customer
   , CustomerCommandRow
   , CustomerCommand
   , customerStream
+  , unCustomerId
   , customerDecider
   , registerCustomer
   , customerRegistered
@@ -19,6 +20,7 @@ import Prelude
 import Data.Either (Either(..))
 import Data.Variant (Variant, inj, match)
 import Domain (Decider)
+import Domain.Id.Internal (StreamId(..))
 import Type.Proxy (Proxy(..))
 
 newtype CustomerId = CustomerId String
@@ -55,8 +57,11 @@ type CustomerCommandRow =
 
 type CustomerCommand = Variant CustomerCommandRow
 
-customerStream :: CustomerId -> String
-customerStream (CustomerId id) = "Customer/" <> id
+customerStream :: CustomerId -> StreamId
+customerStream (CustomerId id) = StreamId ("Customer/" <> id)
+
+unCustomerId :: CustomerId -> String
+unCustomerId (CustomerId id) = id
 
 registerCustomer :: String -> CustomerCommand
 registerCustomer name = inj (Proxy :: Proxy "registerCustomer") { name }

@@ -7,7 +7,7 @@ module Bank.Views
 
 import Prelude
 
-import Bank.Account (AccountEvent)
+import Bank.Account (AccountEvent, AccountId)
 import Data.Maybe (Maybe(..))
 import Data.Tuple (Tuple(..))
 import Data.Variant (match)
@@ -18,10 +18,10 @@ type Summary =
   , balance :: Int
   }
 
-summary :: View String Summary AccountEvent Unit
+summary :: View AccountId Summary AccountId AccountEvent Unit
 summary =
   { initial: { owner: Nothing, balance: 0 }
-  , keyOf: \envelope -> Just envelope.stream
+  , keyOf: \envelope -> Just envelope.id
   , step: \state envelope ->
       Tuple
         ( match
@@ -40,10 +40,10 @@ type StatementLine =
   , balance :: Int
   }
 
-statement :: View String Unit AccountEvent StatementLine
+statement :: View AccountId Unit AccountId AccountEvent StatementLine
 statement =
   { initial: unit
-  , keyOf: \envelope -> Just envelope.stream
+  , keyOf: \envelope -> Just envelope.id
   , step: \_ envelope ->
       Tuple unit
         ( match

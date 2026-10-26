@@ -27,6 +27,7 @@ import Data.Bifunctor (lmap)
 import Data.Either (Either(..))
 import Data.Variant (Variant, expand, inj, match)
 import Domain (Decider)
+import Domain.Id.Internal (StreamId(..))
 import Partial.Unsafe (unsafeCrashWith)
 import Type.Proxy (Proxy(..))
 
@@ -77,8 +78,8 @@ type AccountCommandRow =
 
 type AccountCommand = Variant AccountCommandRow
 
-accountStream :: AccountId -> String
-accountStream (AccountId id) = "Account/" <> id
+accountStream :: AccountId -> StreamId
+accountStream (AccountId id) = StreamId ("Account/" <> id)
 
 openAccount :: String -> AccountCommand
 openAccount owner = inj (Proxy :: Proxy "openAccount") { owner }

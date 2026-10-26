@@ -10,7 +10,8 @@ import Data.Array (snoc)
 import Data.Either (Either(..))
 import Data.Foldable (elem, foldl)
 import Data.Maybe (Maybe(..))
-import Domain (Decider, commit)
+import Domain (Decider, commit, zeroVersion)
+import Domain.Id.Internal (StreamId(..))
 
 -- | A story is a list of steps in the business's own words:
 -- | given this history, when this command, then these events.
@@ -54,7 +55,7 @@ runStory decider steps =
   where
   initial =
     { state: decider.initial
-    , version: 0
+    , version: zeroVersion
     , history: []
     , lastEvents: []
     , lastReply: Nothing
@@ -72,7 +73,7 @@ runStory decider steps =
         , lastRejection = Nothing
         }
     When command ->
-      case commit decider { state: acc.state, version: acc.version, stream: "story" } command of
+      case commit decider { state: acc.state, version: acc.version, stream: StreamId "story" } command of
         Left rejection ->
           Right acc
             { lastEvents = []
@@ -82,10 +83,10 @@ runStory decider steps =
         Right result ->
           Right acc
             { state = result.state
-            , version = result.receipt.version
-            , history = acc.history <> result.receipt.events
-            , lastEvents = result.receipt.events
-            , lastReply = Just result.receipt.reply
+            , version = result.version
+            , history = acc.history <> result.events
+            , lastEvents = result.events
+            , lastReply = Just result.reply
             , lastRejection = Nothing
             }
     Then event ->
