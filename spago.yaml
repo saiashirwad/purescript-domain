@@ -1,0 +1,26 @@
+package:
+  name: domain
+  dependencies:
+    - arrays
+    - console
+    - effect
+    - either
+    - exceptions
+    - foldable-traversable
+    - maybe
+    - ordered-collections
+    - partial
+    - prelude
+    - tuples
+    - variant
+  test:
+    main: Test.Main
+    dependencies:
+      - console
+      - effect
+      - exceptions
+      - prelude
+workspace:
+  packageSet:
+    registry: 81.11.0
+  extraPackages: {}
