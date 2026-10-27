@@ -34,10 +34,27 @@
         },
         "test": {
           "dependencies": [
+            "aff",
+            "argonaut-codecs",
+            "argonaut-core",
+            "arrays",
+            "avar",
             "console",
+            "datetime",
             "effect",
+            "either",
             "exceptions",
-            "prelude"
+            "foldable-traversable",
+            "gen",
+            "maybe",
+            "nonempty",
+            "ordered-collections",
+            "partial",
+            "prelude",
+            "quickcheck",
+            "refs",
+            "strings",
+            "tuples"
           ]
         }
       }
@@ -1116,6 +1133,20 @@
         "prelude"
       ]
     },
+    "lcg": {
+      "type": "registry",
+      "version": "4.0.1",
+      "integrity": "sha256-UJ7clOOCnA/uhvGf/FgfuFHIh/ZVD0Z9SAzKs96JTtk=",
+      "dependencies": [
+        "effect",
+        "integers",
+        "maybe",
+        "numbers",
+        "partial",
+        "prelude",
+        "random"
+      ]
+    },
     "lists": {
       "type": "registry",
       "version": "7.0.1",
@@ -1251,6 +1282,49 @@
         "newtype",
         "prelude",
         "tuples"
+      ]
+    },
+    "quickcheck": {
+      "type": "registry",
+      "version": "8.0.2",
+      "integrity": "sha256-j74DYqCbi5oDtm3iElHFbNNP+ps2ZNMywkp9drQXVAQ=",
+      "dependencies": [
+        "arrays",
+        "console",
+        "control",
+        "effect",
+        "either",
+        "enums",
+        "exceptions",
+        "foldable-traversable",
+        "gen",
+        "identity",
+        "integers",
+        "lazy",
+        "lcg",
+        "lists",
+        "maybe",
+        "newtype",
+        "nonempty",
+        "numbers",
+        "partial",
+        "prelude",
+        "record",
+        "st",
+        "strings",
+        "tailrec",
+        "transformers",
+        "tuples"
+      ]
+    },
+    "random": {
+      "type": "registry",
+      "version": "6.0.1",
+      "integrity": "sha256-ouP2PmeKqGlRwoy7KTDK4zb+dMZ+F4CyqtwCbzU4zpE=",
+      "dependencies": [
+        "effect",
+        "integers",
+        "prelude"
       ]
     },
     "record": {

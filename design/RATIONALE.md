@@ -40,7 +40,7 @@ story account [ given @"accountOpened" { owner: "sam" }, command @"depositMoney"
 
 **Handlers are records keyed by label, compiled to dispatch tables.** `aggregate`, `view`, and `policy` walk the handler record's `RowList` once. They check each label against the spec and build an `Object` keyed by label. Dispatch reads the variant's tag. A `decide` handler names its narrow rows in its signature. `SubRow` proves each narrow row is a sub-row of the spec's row, with the same payload types, so widening is a coercion and `expand` disappears. `decide` and `evolve` must cover their rows (`Covers`). Views and policies name any subset.
 
-**Legible errors come from the structure.** No `Prim.Row` constraint ever sees a label that an instance chain has not checked. Before this rule, a missing handler printed `CannotUnify` and two `Union` failures around the custom message. After it, `design/compile-errors.sh` applies each mistake to the bank, builds, prints the errors, and reverts. Each mistake gets one line, quoted from `iris test`:
+**Legible errors come from the structure.** No `Prim.Row` constraint ever sees a label that an instance chain has not checked. Before this rule, a missing handler printed `CannotUnify` and two `Union` failures around the custom message. After it, `test/compile-errors.sh` applies each mistake to the bank, builds, asserts the expected message, and reverts. Each mistake gets one line, quoted from `iris test`:
 
 | Mistake | Error, at the user's line |
 |---|---|

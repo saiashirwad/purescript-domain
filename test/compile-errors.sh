@@ -1,0 +1,129 @@
+#!/bin/bash
+# Applies one common mistake at a time and asserts the compiler's message.
+# Each case names a file, the text to replace, the replacement, and a
+# fragment the compiler output must contain. Files are restored on exit,
+# even on failure. Exit 0 only if every case matches.
+#
+# A case marked KNOWN pins an error that is not yet a one-line custom
+# message. If its text changes, the case fails: that is a regression or an
+# improvement, and the fragment should be updated deliberately.
+set -u
+cd "$(dirname "$0")/.."
+
+backup="$(mktemp -d)"
+touched=()
+restore() {
+  local f
+  for f in ${touched[@]+"${touched[@]}"}; do
+    cp "$backup/$(echo "$f" | tr '/' '_')" "$f"
+  done
+  rm -rf "$backup"
+}
+trap restore EXIT
+
+failures=0
+
+mutate() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+path, old, new = sys.argv[1:4]
+text = open(path).read()
+if old not in text:
+    sys.exit("compile-errors.sh: %r not found in %s" % (old, path))
+open(path, "w").write(text.replace(old, new, 1))
+PY
+}
+
+expect() {
+  local name="$1" file="$2" from="$3" to="$4" fragment="$5" output status
+  touched+=("$file")
+  cp "$file" "$backup/$(echo "$file" | tr '/' '_')"
+  if ! mutate "$file" "$from" "$to"; then
+    echo "FAIL $name: could not apply the mistake"
+    failures=$((failures + 1))
+    return
+  fi
+  output="$(iris build 2>&1)"
+  status=$?
+  cp "$backup/$(echo "$file" | tr '/' '_')" "$file"
+  if [ "$status" -eq 0 ]; then
+    echo "FAIL $name: the mistake compiled"
+    failures=$((failures + 1))
+  elif ! grep -qF -- "$fragment" <<<"$output"; then
+    echo "FAIL $name: expected the error to contain: $fragment"
+    echo "$output" | grep -E '•|Error' | head -12 | sed 's/^/    /'
+    failures=$((failures + 1))
+  else
+    echo "ok   $name"
+  fi
+}
+
+if ! iris build >/dev/null 2>&1; then
+  echo "FAIL baseline: the project does not build without any mistake"
+  exit 1
+fi
+
+expect "missing decide handler" src/Bank/Account.purs \
+  "decide: { openAccount, depositMoney, withdrawMoney }" "decide: { openAccount, depositMoney }" \
+  "decide is missing a handler for the command withdrawMoney"
+expect "misspelled evolve handler" src/Bank/Account.purs \
+  "moneyWithdrawn: settle" "moneyWithdrawm: settle" \
+  "evolve handles an undeclared event moneyWithdrawm"
+expect "handler rejects with undeclared label" src/Bank/Account.purs \
+  "Decision (notOpen :: {}) (moneyDeposited :: Movement)" "Decision (notOpen :: {}, frozen :: {}) (moneyDeposited :: Movement)" \
+  "a decide handler rejects with an undeclared rejection frozen"
+expect "emit label not in narrow row" src/Bank/Account.purs \
+  'emit @"moneyDeposited" { amount, balanceAfter: balance + amount }' 'emit @"moneyWithdrawn" { amount, balanceAfter: balance + amount }' \
+  "the handler's event row does not include moneyWithdrawn"
+expect "view handles undeclared event" src/Bank/Views.purs \
+  "moneyWithdrawn: \\lines" "moneyWithdrew: \\lines" \
+  "a view handles an undeclared event moneyWithdrew"
+expect "policy orders unknown command" src/Bank/Policy.purs \
+  'order @"openAccount"' 'order @"openAcount"' \
+  "the target aggregate declares no command openAcount"
+expect "spec missing a field" src/Bank/Customer.purs \
+  "  , reply :: Unit
+  }" "  }" \
+  "an aggregate spec needs the field reply"
+expect "context entry of wrong kind" src/Bank.purs \
+  "bank = { account, customer, summary, statement, provisioning }" "bank = { account, customer, summary, statement, provisioning: 3 }" \
+  "a context entry must be an Aggregate, a View, or a Policy, but provisioning is Int"
+expect "narrow payload differs from spec" src/Bank/Account.purs \
+  'Decision (alreadyOpen :: {}) (accountOpened :: { owner :: String })
+openAccount Unopened { owner } = emit @"accountOpened" { owner }
+openAccount (Open _) _ = reject @"alreadyOpen" {}' \
+  'Decision (alreadyOpen :: Unit) (accountOpened :: { owner :: String })
+openAccount Unopened { owner } = emit @"accountOpened" { owner }
+openAccount (Open _) _ = reject @"alreadyOpen" unit' \
+  "is Unit here but {} in the spec"
+expect "cmd with misspelled label" test/Test/Runtime.purs \
+  'cmd @"depositMoney" { amount: 100 })' 'cmd @"depositMony" { amount: 100 })' \
+  "the aggregate declares no command depositMony"
+expect "event sent as a command" test/Test/Runtime.purs \
+  '(cmd @"openAccount" { owner: "sam" })' '(event @"accountOpened" { owner: "sam" })' \
+  "Cannot unify 'Command' with 'Event'"
+expect "missing guard" src/Bank/Api.purs \
+  "  , statement: ownsAccount
+  }" "  }" \
+  "Missing required properties: statement"
+
+# KNOWN: not a custom error. The span is the enclosing signature, not the
+# call, and the message names types rather than the label.
+expect "cmd with wrong payload (KNOWN: plain unification error)" test/Test/Runtime.purs \
+  'cmd @"depositMoney" { amount: 100 })' 'cmd @"depositMoney" { amount: "100" })' \
+  "matching '{ amount :: String }' with '{ amount :: Int }'"
+
+# KNOWN: a custom error, but it prints the whole aggregate spec after the
+# header instead of naming the aggregate.
+expect "view over an aggregate missing from the context (KNOWN: spec dump)" src/Bank.purs \
+  "bank = { account, customer, summary, statement, provisioning }" "bank = { customer, summary, statement, provisioning }" \
+  "a view or policy reads an aggregate this context does not contain:"
+expect "view over a missing aggregate prints the spec (KNOWN: spec dump)" src/Bank.purs \
+  "bank = { account, customer, summary, statement, provisioning }" "bank = { customer, summary, statement, provisioning }" \
+  "state :: AccountState"
+
+if [ "$failures" -ne 0 ]; then
+  echo "$failures case(s) failed"
+  exit 1
+fi
+echo "all compile-error cases match"

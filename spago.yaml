@@ -29,10 +29,27 @@ package:
   test:
     main: Test.Main
     dependencies:
+      - aff
+      - argonaut-codecs
+      - argonaut-core
+      - arrays
+      - avar
       - console
+      - datetime
       - effect
+      - either
       - exceptions
+      - gen
+      - maybe
+      - nonempty
+      - ordered-collections
+      - partial
       - prelude
+      - quickcheck
+      - refs
+      - strings
+      - tuples
+      - foldable-traversable
 workspace:
   packageSet:
     registry: 81.11.0
