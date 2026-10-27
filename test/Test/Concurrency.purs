@@ -7,20 +7,20 @@ import Bank.Account (AccountId(..))
 import Bank.Customer (CustomerId(..))
 import Bank.Policy (mainAccount)
 import Data.Array (length, range)
-import Data.Either (Either(..))
+import Data.Either (Either(..), isLeft)
 import Data.Maybe (Maybe(..), isNothing)
 import Data.String (Pattern(..), contains)
 import Data.Time.Duration (Milliseconds(..))
 import Data.Traversable (for)
-import Domain (cmd, rejection, sequenceNumber, streamIdText, versionNumber)
+import Domain (command, rejection, sequenceNumber, versionNumber)
 import Domain.Runtime (Options, Refusal(..), start)
-import Effect.AVar (AVar)
 import Effect.Aff (Aff, Fiber, attempt, delay, forkAff, joinFiber, killFiber)
 import Effect.Aff.AVar as AVar
 import Effect.Class (liftEffect)
 import Effect.Exception (error, message)
 import Effect.Ref as Ref
-import Test.Support (assertEqual, assertThat, commandId, expectRight, fail, isLeft, testOptions)
+import Test.Support
+  (assertEqual, assertThat, commandId, expectRight, fail, failingOnce, parked, testOptions)
 
 testConcurrency :: Aff Unit
 testConcurrency = do
@@ -36,25 +36,17 @@ testConcurrency = do
 -- | forty deposits really queue for the stream before it starts to drain.
 sameStreamOrder :: Aff Unit
 sameStreamOrder = do
-  gate <- AVar.empty
-  isFirst <- liftEffect (Ref.new true)
-  let
-    options =
-      testOptions
-        { beforeTurn = \_ -> do
-            first <- liftEffect (Ref.modify' (\pending -> { state: false, value: pending }) isFirst)
-            when first (AVar.read gate)
-        }
-  rt <- start bank options
+  held <- parked "account/a-1"
+  rt <- start bank testOptions { beforeTurn = held.beforeTurn }
   let
     sam = AccountId "a-1"
     deposits = range 1 40
   opening <- forkAff
-    (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" }))
+    (rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" }))
   depositing <- for deposits \n -> forkAff
-    (rt.account.send (commandId ("deposit-" <> show n)) sam (cmd @"depositMoney" { amount: n }))
+    (rt.account.send (commandId ("deposit-" <> show n)) sam (command @"depositMoney" { amount: n }))
   delay (Milliseconds 20.0)
-  AVar.put unit gate
+  held.release
   opened <- joinFiber opening >>= expectRight "open"
   receipts <- for depositing \fiber -> joinFiber fiber >>= expectRight "deposit"
   assertEqual "the open ran first" 1 (versionNumber opened.version)
@@ -84,11 +76,11 @@ differentStreamsOverlap = do
   rt <- start bank options
   first <- forkAff
     ( rt.account.send (commandId "open-a") (AccountId "a")
-        (cmd @"openAccount" { owner: CustomerId "a" })
+        (command @"openAccount" { owner: CustomerId "a" })
     )
   second <- forkAff
     ( rt.account.send (commandId "open-b") (AccountId "b")
-        (cmd @"openAccount" { owner: CustomerId "b" })
+        (command @"openAccount" { owner: CustomerId "b" })
     )
   delay (Milliseconds 50.0)
   overlapped <- AVar.tryRead bothStarted
@@ -104,16 +96,16 @@ busyStreamWaits :: Aff Unit
 busyStreamWaits = do
   held <- parked "account/a-1"
   completed <- liftEffect (Ref.new 0)
-  rt <- start bank held.options
+  rt <- start bank testOptions { beforeTurn = held.beforeTurn }
   let
     sam = AccountId "a-1"
-    send key command = do
-      receipt <- rt.account.send (commandId key) sam command
+    send key sent = do
+      receipt <- rt.account.send (commandId key) sam sent
       liftEffect (Ref.modify_ (_ + 1) completed)
       pure receipt
-  opening <- forkAff (send "open" (cmd @"openAccount" { owner: CustomerId "sam" }))
+  opening <- forkAff (send "open" (command @"openAccount" { owner: CustomerId "sam" }))
   AVar.take held.arrived
-  depositing <- forkAff (send "deposit" (cmd @"depositMoney" { amount: 100 }))
+  depositing <- forkAff (send "deposit" (command @"depositMoney" { amount: 100 }))
   delay (Milliseconds 20.0)
   finishedEarly <- liftEffect (Ref.read completed)
   assertEqual "nothing completes while the stream is held" 0 finishedEarly
@@ -137,14 +129,14 @@ abandonedCommands = do
 waitingForTheStream :: Aff Unit
 waitingForTheStream = do
   held <- parked "account/a-1"
-  rt <- start bank held.options
+  rt <- start bank testOptions { beforeTurn = held.beforeTurn }
   let
     sam = AccountId "a-1"
   opening <- forkAff
-    (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" }))
+    (rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" }))
   AVar.take held.arrived
   waiting <-
-    forkAff (rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 }))
+    forkAff (rt.account.send (commandId "deposit") sam (command @"depositMoney" { amount: 100 }))
   delay (Milliseconds 5.0)
   abandonThenStop rt waiting held.release
   _ <- joinFiber opening >>= expectRight "open"
@@ -154,11 +146,11 @@ waitingForTheStream = do
 duringTheTurn :: Aff Unit
 duringTheTurn = do
   held <- parked "customer/c-7"
-  rt <- start bank held.options
+  rt <- start bank testOptions { beforeTurn = held.beforeTurn }
   let
     eve = CustomerId "c-7"
-  registering <-
-    forkAff (rt.customer.send (commandId "register") eve (cmd @"registerCustomer" { name: "eve" }))
+  registering <- forkAff
+    (rt.customer.send (commandId "register") eve (command @"registerCustomer" { name: "eve" }))
   AVar.take held.arrived
   abandonThenStop rt registering held.release
   registered <- rt.customer.history eve
@@ -169,33 +161,15 @@ duringTheTurn = do
 afterTheCommit :: Aff Unit
 afterTheCommit = do
   held <- parked "account/c-7-main"
-  rt <- start bank held.options
+  rt <- start bank testOptions { beforeTurn = held.beforeTurn }
   let
     eve = CustomerId "c-7"
-  registering <-
-    forkAff (rt.customer.send (commandId "register") eve (cmd @"registerCustomer" { name: "eve" }))
+  registering <- forkAff
+    (rt.customer.send (commandId "register") eve (command @"registerCustomer" { name: "eve" }))
   AVar.take held.arrived
   abandonThenStop rt registering held.release
   provisioned <- rt.account.history (mainAccount eve)
   assertEqual "the order of a command abandoned after its commit committed" 1 (length provisioned)
-
--- | Park every command on `stream` until `release`. `arrived` fills when the
--- | first one reaches its turn, and `turns` counts the ones that have.
-parked ::
-  String -> Aff { options :: Options, arrived :: AVar Unit, turns :: Aff Int, release :: Aff Unit }
-parked stream = do
-  arrived <- AVar.empty
-  gate <- AVar.empty
-  count <- liftEffect (Ref.new 0)
-  let
-    options =
-      testOptions
-        { beforeTurn = \at -> when (streamIdText at == stream) do
-            liftEffect (Ref.modify_ (_ + 1) count)
-            void (AVar.tryPut unit arrived)
-            AVar.read gate
-        }
-  pure { options, arrived, turns: liftEffect (Ref.read count), release: AVar.put unit gate }
 
 -- | Kill `caller`, then stop. `stop` must still be waiting when the held
 -- | stream is released, and must return once the work drains. The kill is
@@ -216,31 +190,24 @@ abandonThenStop rt caller release = do
 -- | a domain rejection stops the stream.
 failureIsolation :: Aff Unit
 failureIsolation = do
-  shouldFail <- liftEffect (Ref.new true)
-  let
-    options =
-      testOptions
-        { beforeTurn = \_ -> do
-            failing <-
-              liftEffect (Ref.modify' (\pending -> { state: false, value: pending }) shouldFail)
-            when failing (fail "hook failure")
-        }
-  rt <- start bank options
+  failing <- failingOnce "account/a-1" "hook failure"
+  rt <- start bank testOptions { beforeTurn = failing }
   let
     sam = AccountId "a-1"
   failed <- attempt
-    (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" }))
+    (rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" }))
   case failed of
     Left exception -> assertThat "the caller sees the hook failure"
       (contains (Pattern "hook failure") (message exception))
     Right _ -> fail "the hook did not fail the send"
   none <- rt.account.history sam
   assertEqual "a failed command commits nothing" 0 (length none)
-  refused <- rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 })
+  refused <- rt.account.send (commandId "deposit") sam (command @"depositMoney" { amount: 100 })
   assertEqual "a domain rejection survives the stream" (Left (Rejected (rejection @"notOpen" {})))
     (map _.events refused)
-  opened <- expectRight "retry open"
-    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
+  opened <-
+    expectRight "retry open" =<< rt.account.send (commandId "open") sam
+      (command @"openAccount" { owner: CustomerId "sam" })
   assertEqual "the same id runs again after a hook failure" 1 (versionNumber opened.version)
   rt.stop
 
@@ -248,37 +215,27 @@ failureIsolation = do
 -- | Afterwards sends fail and a second stop returns.
 shutdownDrains :: Aff Unit
 shutdownDrains = do
-  gate <- AVar.empty
-  started <- AVar.empty
-  isFirst <- liftEffect (Ref.new true)
-  let
-    options =
-      testOptions
-        { beforeTurn = \_ -> do
-            first <- liftEffect (Ref.modify' (\pending -> { state: false, value: pending }) isFirst)
-            when first do
-              void (AVar.tryPut unit started)
-              AVar.read gate
-        }
-  rt <- start bank options
+  held <- parked "account/a-1"
+  rt <- start bank testOptions { beforeTurn = held.beforeTurn }
   let
     sam = AccountId "a-1"
   opening <- forkAff
-    (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" }))
-  AVar.take started
+    (rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" }))
+  AVar.take held.arrived
   depositing <-
-    forkAff (rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 }))
+    forkAff (rt.account.send (commandId "deposit") sam (command @"depositMoney" { amount: 100 }))
   delay (Milliseconds 20.0)
   stopping <- forkAff rt.stop
   delay (Milliseconds 20.0)
-  late <- attempt (rt.account.send (commandId "late") sam (cmd @"depositMoney" { amount: 1 }))
+  late <- attempt (rt.account.send (commandId "late") sam (command @"depositMoney" { amount: 1 }))
   assertThat "a send while stopping is refused" (isLeft late)
-  AVar.put unit gate
+  held.release
   _ <- joinFiber opening >>= expectRight "open before stop"
   drained <- joinFiber depositing >>= expectRight "queued deposit"
   joinFiber stopping
   assertEqual "stop drains the work already accepted" 2 (versionNumber drained.version)
-  afterStop <- attempt (rt.account.send (commandId "after") sam (cmd @"depositMoney" { amount: 1 }))
+  afterStop <-
+    attempt (rt.account.send (commandId "after") sam (command @"depositMoney" { amount: 1 }))
   assertThat "a send after stop is refused" (isLeft afterStop)
   rt.stop
   history <- rt.account.history sam
@@ -294,8 +251,8 @@ shutdownDrainsCascades = do
   rt <- start bank slow
   let
     ada = CustomerId "c-2"
-  registering <-
-    forkAff (rt.customer.send (commandId "register") ada (cmd @"registerCustomer" { name: "ada" }))
+  registering <- forkAff
+    (rt.customer.send (commandId "register") ada (command @"registerCustomer" { name: "ada" }))
   rt.stop
   provisioned <- rt.summary.read (mainAccount ada)
   assertEqual "stop waits for the policy cascade" (Just { owner: Just ada, balance: 0 }) provisioned

@@ -30,14 +30,13 @@ workspace:
 
 Then run `iris build`.
 
-To run this repository's own checks, run these commands from its root:
+To run this repository's checks, run this command from its root:
 
 ```sh
-iris test
-test/compile-errors.sh
+test/check.sh
 ```
 
-`iris test` ends with `All tests passed.`, and `test/compile-errors.sh` ends with `all compile-error cases match`.
+`test/check.sh` is the one gate. It runs `iris test` and fails unless the output has the line `All tests passed.`, because a suite that stops early can still exit 0. Then it runs `test/compile-errors.sh`, which applies common mistakes and asserts each compiler message, and `test/check-snippets.py`, which checks every code block in this README and in `docs/design.md` against the source.
 
 ## Build a bank
 
@@ -143,25 +142,25 @@ Give every `decide` handler a signature. The library checks the narrow rows in t
 A story runs given events and a command against the pure aggregate, then checks what it emitted, rejected, or replied.
 
 ```purescript
-import Domain.Story (command, given, rejects, replies, emits, story)
+import Domain.Story (emits, given, rejects, replies, sends, story)
 ```
 
 ```purescript
   expectStory "deposits into an open account and replies with the balance" $ story account
     [ given @"accountOpened" { owner: CustomerId "sam" }
-    , command @"depositMoney" { amount: 100 }
+    , sends @"depositMoney" { amount: 100 }
     , emits @"moneyDeposited" { amount: 100, balanceAfter: 100 }
     , replies { balance: 100 }
     ]
   expectStory "refuses to withdraw more than the balance" $ story account
     [ given @"accountOpened" { owner: CustomerId "sam" }
     , given @"moneyDeposited" { amount: 100, balanceAfter: 100 }
-    , command @"withdrawMoney" { amount: 150 }
+    , sends @"withdrawMoney" { amount: 150 }
     , rejects @"insufficientFunds" { balance: 100, requested: 150 }
     ]
 ```
 
-`story` returns `Right` with the final state, or `Left` with the first failed expectation, such as `expected event ..., got ...`. `expectStory` in `test/Test/Stories.purs` turns a `Left` into a test failure.
+The `emits` steps after a command list its events exactly, in order, so a story that leaves out an emitted event fails. `story` returns `Right` with the final state, or `Left` with the first failed expectation, such as `expected events ..., got ...`. `expectStory` in `test/Test/Stories.purs` turns a `Left` into a test failure.
 
 ### Add a view
 
@@ -263,7 +262,7 @@ Each label becomes a runtime handle (`rt.account`), a stream category (`account/
 `start` returns one handle per aggregate and view, plus `stop`. These lines are from `test/Test/Runtime.purs`:
 
 ```purescript
-import Domain (cmd, event, rejection, sequenceNumber, versionNumber)
+import Domain (command, event, rejection, sequenceNumber, versionNumber)
 import Domain.Runtime (Refusal(..), start)
 ```
 
@@ -274,26 +273,27 @@ import Domain.Runtime (Refusal(..), start)
   before <- rt.summary.read sam
   assertEqual "a view of an unseen entity is empty" Nothing before
 
-  _ <- expectRight "open"
-    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
+  _ <-
+    expectRight "open" =<< rt.account.send (commandId "open") sam
+      (command @"openAccount" { owner: CustomerId "sam" })
   afterOpen <- rt.summary.read sam
   assertEqual "a read right after send sees the open"
     (Just { owner: Just (CustomerId "sam"), balance: 0 }) afterOpen
 ```
 
-`send` takes a command id, the aggregate id, and a command built with `cmd`. It returns `Right` with a receipt that holds `commandId`, `version`, `events`, and `reply`, or `Left` with a `Refusal`. A refusal is `Rejected` with the aggregate's rejection, or `Reused` when the command id already names a different command on that stream. Views update in the same step as the commit, so the read right after `send` sees the new row.
+`send` takes a command id, the aggregate id, and a command built with `command`. It returns `Right` with a receipt that holds `commandId`, `version`, `events`, and `reply`, or `Left` with a `Refusal`. A refusal is `Rejected` with the aggregate's rejection, or `Reused` when the command id already names a different command on that stream. Views update in the same step as the commit, so the read right after `send` sees the new row.
 
 A command id names one command to one stream. Sending the same id again returns the stored receipt and appends nothing:
 
 ```purescript
   deposited <- expectRight "deposit"
-    =<< rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 })
+    =<< rt.account.send (commandId "deposit") sam (command @"depositMoney" { amount: 100 })
   assertEqual "deposit replies with the balance" 100 deposited.reply.balance
   assertEqual "deposit is version 2" 2 (versionNumber deposited.version)
 
   retried <- expectRight "retry"
-    =<< rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 })
-  assertEqual "a retry returns the stored receipt" (show deposited) (show retried)
+    =<< rt.account.send (commandId "deposit") sam (command @"depositMoney" { amount: 100 })
+  assertEqual "a retry returns the stored receipt" deposited retried
   history <- rt.account.history sam
   assertEqual "a retry appends nothing" [ 1, 2 ] (map (sequenceNumber <<< _.seq) history)
 ```
@@ -342,7 +342,7 @@ import Domain.Http (Method(..), serve)
 
 ```purescript
     call who method path key body = serve bank guards rt who
-      { method, path, headers: maybe' Map.empty (Map.singleton "idempotency-key") key, body }
+      { method, path, headers: maybe Map.empty (Map.singleton "idempotency-key") key, body }
 ```
 
 An admin's `POST /account/a-1/openAccount` with an `idempotency-key` header and the body `{"owner":"sam"}` returns status 200 and the receipt:
@@ -351,7 +351,7 @@ An admin's `POST /account/a-1/openAccount` with an `idempotency-key` header and 
 {"events":[{"type":"accountOpened","value":{"owner":"sam"}}],"reply":{"balance":0},"version":1}
 ```
 
-A rejection returns 409 with `{"type":"insufficientFunds","value":{"balance":0,"requested":5}}`. A guard that refuses returns 403. An `idempotency-key` reused for a different command returns 422. A failure inside the runtime, such as a request after `rt.stop`, returns 500 with `{"error":"internal error"}` and never the failure's own message. `GET /summary/a-1` reads the view's row. `GET /dashboard/sam` reads the keyed row for customer `sam`.
+A rejection returns 409 with `{"type":"insufficientFunds","value":{"balance":0,"requested":5}}`. A guard that refuses returns 403. An `idempotency-key` reused for a different command returns 422. A failure inside the runtime, such as a request after `rt.stop`, returns 500 with `{"error":"internal error"}` and never the failure's own message. The operator still sees the cause. The runtime emits a span for every command, and a failed command's span has the outcome `failed` and the message in its `error` attribute. `GET /summary/a-1` reads the view's row. `GET /dashboard/sam` reads the keyed row for customer `sam`.
 
 ## Common mistakes and their errors
 
@@ -360,7 +360,7 @@ Each of these is a case in `test/compile-errors.sh`, which applies the mistake t
 A `decide` record without a handler for `withdrawMoney`:
 
 ```
-Error! · [CustomFailure] · src/Bank/Account.purs:59:11
+Error! · [CustomFailure] · src/Bank/Account.purs:57:11
   •
   │
   • decide is missing a handler for the command withdrawMoney
@@ -373,7 +373,7 @@ Error! · [CustomFailure] · src/Bank/Account.purs:59:11
 A deposit handler that emits `moneyWithdrawn`, which its `Decision` row does not include:
 
 ```
-Error! · [CustomFailure] · src/Bank/Account.purs:84:17
+Error! · [CustomFailure] · src/Bank/Account.purs:82:17
   •
   │
   • the handler's event row does not include moneyWithdrawn
@@ -398,11 +398,10 @@ Error! · [CustomFailure] · src/Bank/Views.purs:42:13
 
 ## Modules
 
-- `Domain` declares specs, aggregates, views, and policies. It is pure.
+- `Domain` declares specs, aggregates, views, and policies, and holds command ids, versions, and envelopes. It is pure.
 - `Domain.Story` runs given/when/then stories against an aggregate.
 - `Domain.Runtime` starts a context and returns its handles.
 - `Domain.Http` serves a context over a transport-neutral request type.
 - `Domain.Codec` derives JSON codecs for commands, events, and rejections, with versioned upcasting.
-- `Domain.Stream` is one command's turn on one stream, as a pure function.
-- `Domain.Id` holds command ids, stream ids, versions, and sequences.
-- `Domain.Labels` holds the label checks behind the compile errors.
+
+The modules under `Domain.Internal` are the library's own plumbing. Do not import them.

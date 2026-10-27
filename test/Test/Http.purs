@@ -9,12 +9,14 @@ import Bank.Customer (CustomerId(..))
 import Data.Argonaut.Core (fromString, jsonEmptyObject, stringify)
 import Data.Argonaut.Encode (encodeJson)
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), maybe)
 import Data.Set as Set
 import Domain.Http (Method(..), serve)
 import Domain.Runtime (start)
 import Effect.Aff (Aff)
-import Test.Support (assertEqual, assertJson, testOptions)
+import Effect.Class (liftEffect)
+import Effect.Ref as Ref
+import Test.Support (assertEqual, assertJson, recordingOptions, testOptions)
 
 testHttp :: Aff Unit
 testHttp = do
@@ -36,7 +38,7 @@ testHttp = do
       , accounts: Set.singleton (AccountId "c-1-main")
       }
     call who method path key body = serve bank guards rt who
-      { method, path, headers: maybe' Map.empty (Map.singleton "idempotency-key") key, body }
+      { method, path, headers: maybe Map.empty (Map.singleton "idempotency-key") key, body }
     post who path key body = call who POST path (Just key) body
     get who path = call who GET path Nothing jsonEmptyObject
 
@@ -126,7 +128,8 @@ testHttp = do
     """{"accounts":1,"balance":0}""" newcomerDashboard.body
   rt.stop
 
-  stopped <- start bank testOptions
+  { options, spans } <- recordingOptions
+  stopped <- start bank options
   stopped.stop
   failed <- serve bank guards stopped admin
     { method: POST
@@ -136,7 +139,7 @@ testHttp = do
     }
   assertEqual "a runtime failure is a 500" 500 failed.status
   assertJson "a 500 does not echo the failure" """{"error":"internal error"}""" failed.body
-  where
-  maybe' default f = case _ of
-    Nothing -> default
-    Just value -> f value
+  recorded <- liftEffect (Ref.read spans)
+  assertEqual "the trace carries the failure that the 500 hides"
+    [ Just "Domain.Runtime: the runtime is stopped" ]
+    (map (Map.lookup "error" <<< _.attributes) recorded)

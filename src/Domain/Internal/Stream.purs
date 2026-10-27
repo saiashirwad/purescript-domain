@@ -1,8 +1,6 @@
--- | What one command does to one stream, as a pure function. The runtime
--- | is a host around `turn`: it reads the clock, runs one turn per stream at
--- | a time, keeps the stream a commit returns, applies views to its facts,
--- | and dispatches the policies' orders.
-module Domain.Stream (Stream, Stored, Fact, Turn(..), open, turn) where
+-- | What one command does to one stream, as a pure function of the
+-- | stream, the command, its id, and the time.
+module Domain.Internal.Stream (Stream, Stored, Fact, Turn(..), Refusal(..), open, turn) where
 
 import Prelude
 
@@ -15,9 +13,9 @@ import Data.Foldable (foldl)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
-import Domain
-  (class Spec, Aggregate, Command, Envelope, Event, Receipt, Rejection, commit, decider, tagOf)
-import Domain.Id (CommandId, StreamId, Version, advance, sequencesAfter, zeroVersion)
+import Domain.Internal.Id (CommandId, StreamId, Version, advance, sequencesAfter, zeroVersion)
+import Domain.Internal.Kernel
+  (class Spec, Aggregate, Command, Envelope, Event, Receipt, Rejection, commit, decider, labelOf)
 
 -- | One stream's state. Receipts are kept per stream: a command id names
 -- | one command to one stream, so the same id sent to another stream is a
@@ -45,14 +43,25 @@ type Stored id spec b =
 type Fact id s spec = { envelope :: Envelope id (Event spec), state :: s }
 
 -- | A refusal stores nothing, so the same command id may be decided again.
--- | `Conflict` is a command id that already names a command with another
--- | label on this stream.
 data Turn id s spec b
   = Committed
       { stream :: Stream id s spec b, stored :: Stored id spec b, facts :: Array (Fact id s spec) }
   | Duplicate (Stored id spec b)
-  | Conflict (Stored id spec b)
-  | Refused (Rejection spec)
+  | Refused (Refusal spec)
+
+-- | Why a command did not commit. `Rejected` is the aggregate's answer.
+-- | `Reused` means the command id already names another command on this
+-- | stream, the one labelled `command`.
+data Refusal spec = Rejected (Rejection spec) | Reused { commandId :: CommandId, command :: String }
+
+instance Eq (Rejection spec) => Eq (Refusal spec) where
+  eq (Rejected x) (Rejected y) = x == y
+  eq (Reused x) (Reused y) = x == y
+  eq _ _ = false
+
+instance Show (Rejection spec) => Show (Refusal spec) where
+  show (Rejected rejected) = "(Rejected " <> show rejected <> ")"
+  show (Reused reused) = "(Reused " <> show reused <> ")"
 
 -- | A stream that holds no events yet.
 open ::
@@ -76,21 +85,21 @@ turn ::
   Command spec ->
   Stream id s spec b ->
   Turn id s spec b
-turn aggregate at commandId command current = case Map.lookup commandId current.receipts of
+turn aggregate at commandId sent current = case Map.lookup commandId current.receipts of
   Just stored
-    | stored.command == tagOf command -> Duplicate stored
-    | otherwise -> Conflict stored
-  Nothing -> case commit aggregate current.state command of
-    Left refused -> Refused refused
+    | stored.command == labelOf sent -> Duplicate stored
+    | otherwise -> Refused (Reused { commandId, command: stored.command })
+  Nothing -> case commit aggregate current.state sent of
+    Left rejected -> Refused (Rejected rejected)
     Right committed ->
       let
         count = length committed.events
         envelopes = zipWith
-          (\seq fact -> { id: current.id, stream: current.stream, seq, commandId, at, event: fact })
+          (\seq event -> { id: current.id, stream: current.stream, seq, commandId, at, event })
           (sequencesAfter current.version count) committed.events
         version = advance current.version count
         stored =
-          { command: tagOf command
+          { command: labelOf sent
           , receipt: { commandId, version, events: committed.events, reply: committed.reply }
           , envelopes
           }

@@ -6,7 +6,9 @@ import Bank.Account (Account, AccountState(..), account)
 import Bank.Customer (CustomerId(..))
 import Data.Array.NonEmpty (cons')
 import Data.Either (Either(..))
-import Domain (Command, Event, cmd, commit, event, replay)
+import Data.Foldable (foldl, sum)
+import Data.Variant (match)
+import Domain (Command, Event, command, commit, event, replay, toVariant)
 import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
 import Test.QuickCheck (quickCheck, (===))
@@ -29,12 +31,12 @@ genEvent = oneOf (cons' (opened <$> genOwner) [ movement moneyDeposited, movemen
 genCommand :: Gen (Command Account)
 genCommand = oneOf
   ( cons' (openAccount <$> genOwner)
-      [ depositMoney <$> chooseInt 0 1000, withdrawMoney <$> chooseInt 0 1000 ]
+      [ depositMoney <$> chooseInt (-100) 1000, withdrawMoney <$> chooseInt (-100) 1000 ]
   )
   where
-  openAccount owner = cmd @"openAccount" { owner }
-  depositMoney amount = cmd @"depositMoney" { amount }
-  withdrawMoney amount = cmd @"withdrawMoney" { amount }
+  openAccount owner = command @"openAccount" { owner }
+  depositMoney amount = command @"depositMoney" { amount }
+  withdrawMoney amount = command @"withdrawMoney" { amount }
 
 genState :: Gen AccountState
 genState = oneOf
@@ -46,6 +48,8 @@ genState = oneOf
       ]
   )
 
+-- | Replay is a fold, and any run of commands from a new account leaves a
+-- | balance that is the sum of its movements and never negative.
 testReplay :: Aff Unit
 testReplay = liftEffect do
   quickCheck do
@@ -57,8 +61,22 @@ testReplay = liftEffect do
           === replay account (replay account start before) after
       )
   quickCheck do
-    start <- genState
-    sent <- genCommand
-    pure case commit account start sent of
-      Left _ -> true === true
-      Right committed -> committed.state === replay account start committed.events
+    sent <- arrayOf genCommand
+    let
+      final = foldl step { state: Unopened, events: [] } sent
+      balance = case final.state of
+        Unopened -> 0
+        Open open -> open.balance
+    pure
+      ( { balance, overdrawn: balance < 0 }
+          === { balance: sum (map movement final.events), overdrawn: false }
+      )
+  where
+  step acc next = case commit account acc.state next of
+    Left _ -> acc
+    Right committed -> { state: committed.state, events: acc.events <> committed.events }
+
+  movement :: Event Account -> Int
+  movement =
+    match { accountOpened: \_ -> 0, moneyDeposited: _.amount, moneyWithdrawn: negate <<< _.amount }
+      <<< toVariant

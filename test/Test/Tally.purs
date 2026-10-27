@@ -7,30 +7,17 @@ import Prelude
 
 import Bank.Customer (Customer, CustomerId(..), customer)
 import Data.Array (length)
-import Data.Either (Either(..))
+import Data.Either (Either(..), isLeft)
 import Data.Maybe (Maybe(..), fromJust)
 import Data.Newtype (class Newtype)
 import Data.Variant (Variant)
 import Domain
-  ( Aggregate
-  , Decision
-  , Policy
-  , View
-  , aggregate
-  , cmd
-  , emit
-  , order
-  , parseCommandId
-  , policy
-  , streamIdText
-  , view
-  )
+  (Aggregate, Decision, Policy, View, aggregate, command, emit, order, parseCommandId, policy, view)
 import Domain.Runtime (start)
 import Effect.Aff (Aff, attempt)
-import Effect.Class (liftEffect)
-import Effect.Ref as Ref
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
-import Test.Support (assertEqual, assertThat, commandId, expectRight, fail, isLeft, testOptions)
+import Test.Support
+  (assertEqual, assertThat, commandId, expectRight, fail, failingOnce, testOptions)
 
 newtype TallyId = TallyId String
 
@@ -98,7 +85,7 @@ derivedOrderIds = do
   let
     ada = CustomerId "c-1"
     registerAda =
-      rt.customer.send (commandId "register") ada (cmd @"registerCustomer" { name: "ada" })
+      rt.customer.send (commandId "register") ada (command @"registerCustomer" { name: "ada" })
   _ <- expectRight "register" =<< registerAda
   _ <- expectRight "retry register" =<< registerAda
   counts <- rt.tally.history target
@@ -109,20 +96,12 @@ derivedOrderIds = do
 -- | sees the failure; retrying the trigger re-dispatches the lost order.
 retryHealsALostOrder :: Aff Unit
 retryHealsALostOrder = do
-  failNext <- liftEffect (Ref.new true)
-  let
-    options =
-      testOptions
-        { beforeTurn = \stream -> when (streamIdText stream == "tally/t") do
-            failing <-
-              liftEffect (Ref.modify' (\pending -> { state: false, value: pending }) failNext)
-            when failing (fail "the tally is down")
-        }
-  rt <- start { customer, tally, counted } options
+  failing <- failingOnce "tally/t" "the tally is down"
+  rt <- start { customer, tally, counted } testOptions { beforeTurn = failing }
   let
     ada = CustomerId "c-1"
     registerAda =
-      rt.customer.send (commandId "register") ada (cmd @"registerCustomer" { name: "ada" })
+      rt.customer.send (commandId "register") ada (command @"registerCustomer" { name: "ada" })
   lost <- attempt registerAda
   assertThat "the caller sees the failed order" (isLeft lost)
   registered <- rt.customer.history ada
@@ -141,9 +120,9 @@ clientsCannotClaimOrderIds = do
   rt <- start { customer, tally, counted } testOptions
   let
     spoofed = unsafePartial (fromJust (parseCommandId "counted:customer/c-1@1#0"))
-  _ <- expectRight "client bump" =<< rt.tally.send spoofed target (cmd @"bump" {})
+  _ <- expectRight "client bump" =<< rt.tally.send spoofed target (command @"bump" {})
   _ <- expectRight "register" =<< rt.customer.send (commandId "register") (CustomerId "c-1")
-    (cmd @"registerCustomer" { name: "ada" })
+    (command @"registerCustomer" { name: "ada" })
   counts <- rt.tally.history target
   assertEqual "the client's bump and the policy's bump both count" 2 (length counts)
   rt.stop
@@ -152,9 +131,10 @@ clientsCannotClaimOrderIds = do
 prototypeLabels :: Aff Unit
 prototypeLabels = do
   rt <- start { tally, bumps } testOptions
-  _ <- expectRight "toString" =<< rt.tally.send (commandId "poke") target (cmd @"toString" {})
-  _ <- expectRight "bump" =<< rt.tally.send (commandId "bump") target (cmd @"bump" {})
-  _ <- expectRight "__proto__" =<< rt.tally.send (commandId "proto") target (cmd @"__proto__" {})
+  _ <- expectRight "toString" =<< rt.tally.send (commandId "poke") target (command @"toString" {})
+  _ <- expectRight "bump" =<< rt.tally.send (commandId "bump") target (command @"bump" {})
+  _ <-
+    expectRight "__proto__" =<< rt.tally.send (commandId "proto") target (command @"__proto__" {})
   history <- rt.tally.history target
   assertEqual "every command committed" 3 (length history)
   row <- rt.bumps.read target
@@ -166,8 +146,8 @@ prototypeLabels = do
 failingViewCommitsNothing :: Aff Unit
 failingViewCommitsNothing = do
   rt <- start { tally, bumps, fragile } testOptions
-  _ <- expectRight "first bump" =<< rt.tally.send (commandId "one") target (cmd @"bump" {})
-  broken <- attempt (rt.tally.send (commandId "two") target (cmd @"bump" {}))
+  _ <- expectRight "first bump" =<< rt.tally.send (commandId "one") target (command @"bump" {})
+  broken <- attempt (rt.tally.send (commandId "two") target (command @"bump" {}))
   case broken of
     Left _ -> pure unit
     Right _ -> fail "a throwing view did not fail the command"

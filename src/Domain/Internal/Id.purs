@@ -1,9 +1,8 @@
 -- | Command ids, stream ids, versions, and sequences. Constructors stay
 -- | private, so a client's `CommandId` comes only from `parseCommandId`,
 -- | which refuses a blank string, and an order's only from
--- | `derivedCommandId`. `Domain` re-exports what callers need. The stream,
--- | version, and order-id builders are for the runtime.
-module Domain.Id
+-- | `derivedCommandId`, which `Domain` does not re-export.
+module Domain.Internal.Id
   ( CommandId
   , StreamId
   , Version
@@ -11,7 +10,6 @@ module Domain.Id
   , parseCommandId
   , commandIdText
   , streamIdText
-  , parseVersion
   , versionNumber
   , sequenceNumber
   , zeroVersion
@@ -73,11 +71,6 @@ commandIdText = case _ of
 
 streamIdText :: StreamId -> String
 streamIdText (StreamId value) = value
-
-parseVersion :: Int -> Maybe Version
-parseVersion value
-  | value < 0 = Nothing
-  | otherwise = Just (Version value)
 
 versionNumber :: Version -> Int
 versionNumber (Version value) = value

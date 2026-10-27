@@ -6,6 +6,7 @@ package:
     - argonaut-core
     - arrays
     - avar
+    - bifunctors
     - catenable-lists
     - datetime
     - effect
@@ -13,7 +14,6 @@ package:
     - exceptions
     - foldable-traversable
     - foreign-object
-    - integers
     - maybe
     - newtype
     - now
@@ -39,9 +39,7 @@ package:
       - effect
       - either
       - exceptions
-      - gen
       - maybe
-      - nonempty
       - ordered-collections
       - partial
       - prelude

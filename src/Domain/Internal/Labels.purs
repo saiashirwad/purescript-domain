@@ -3,43 +3,40 @@
 -- | that names the label. Every lookup is an instance chain that fails with
 -- | a custom message, and no caller puts a `Prim.Row` constraint on a label
 -- | it has not checked first.
-module Domain.Labels
+module Domain.Internal.Labels
   ( class Field
+  , class FieldOf
   , class IsVariant
   , class SubRow
-  , class Has
   , class Covers
-  , class HasLabel
   )
   where
 
 import Data.Variant (Variant)
-import Prim.RowList (Cons, Nil, RowList)
+import Prim.RowList (class RowToList, Cons, Nil, RowList)
 import Prim.TypeError (class Fail, Above, Beside, Quote, QuoteLabel, Text)
 
--- | `l` is a label of `rl`; otherwise compilation fails with `what` followed
--- | by the label.
-class HasLabel :: Symbol -> Symbol -> RowList Type -> Constraint
-class HasLabel what l rl
-
-instance HasLabel what l (Cons l x t)
-else instance HasLabel what l t => HasLabel what l (Cons m x t)
-else instance Fail (Beside (Text what) (QuoteLabel l)) => HasLabel what l Nil
-
--- | Every label of `expected` has an entry in `given`.
-class Covers :: Symbol -> RowList Type -> RowList Type -> Constraint
-class Covers what expected given
-
-instance Covers what Nil given
-instance (HasLabel what l given, Covers what t given) => Covers what (Cons l x t) given
-
--- | The type of field `l` in `rl`.
+-- | The type of field `l` in `rl`; otherwise compilation fails with `what`
+-- | followed by the label.
 class Field :: Symbol -> Symbol -> RowList Type -> Type -> Constraint
 class Field what l rl a | l rl -> a
 
 instance Field what l (Cons l a t) a
 else instance Field what l t a => Field what l (Cons m x t) a
 else instance Fail (Beside (Text what) (QuoteLabel l)) => Field what l Nil a
+
+-- | `Field` over a row.
+class FieldOf :: Symbol -> Symbol -> Row Type -> Type -> Constraint
+class FieldOf what l row a | l row -> a
+
+instance (RowToList row rl, Field what l rl a) => FieldOf what l row a
+
+-- | Every label of `expected` has an entry in `given`.
+class Covers :: Symbol -> RowList Type -> RowList Type -> Constraint
+class Covers what expected given
+
+instance Covers what Nil given
+instance (Field what l given y, Covers what t given) => Covers what (Cons l x t) given
 
 class IsVariant :: Symbol -> Type -> Row Type -> Constraint
 class IsVariant what t row | t -> row

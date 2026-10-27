@@ -11,7 +11,7 @@
 -- | command needs its own decision about who may send it. A view label takes
 -- | one `principal -> key -> Boolean`. A failure inside the runtime is a 500
 -- | whose body says nothing about the failure.
-module Domain.Http (Method(..), Request, Response, serve, class Routes, routes) where
+module Domain.Http (Method(..), Request, Response, serve) where
 
 import Prelude
 
@@ -26,10 +26,10 @@ import Data.Maybe (Maybe(..), maybe)
 import Data.Newtype (class Newtype, wrap)
 import Data.String (Pattern(..), split)
 import Data.Symbol (class IsSymbol, reflectSymbol)
-import Domain
-  (class Spec, Aggregate, Command, Event, Policy, Rejection, View, parseCommandId, versionNumber)
-import Domain.Codec (class DecodeCases, class EncodeCases, decodeLabelled, encodeLabelled)
-import Domain.Labels (class Covers, class Field)
+import Domain.Internal.Codec (class DecodeCases, class EncodeCases, decodeLabelled, encodeLabelled)
+import Domain.Internal.Id (parseCommandId, versionNumber)
+import Domain.Internal.Kernel (class Spec, Aggregate, Command, Event, Policy, Rejection, View)
+import Domain.Internal.Labels (class Covers, class FieldOf)
 import Domain.Runtime (AggregateHandle, Refusal(..), ViewHandle)
 import Effect.Aff (Aff, catchError)
 import Prim.Row as Row
@@ -43,12 +43,7 @@ data Method = GET | POST
 derive instance Eq Method
 
 -- | Transport-neutral. A server adapter fills it; header keys are lowercase.
-type Request =
-  { method :: Method
-  , path :: String
-  , headers :: Map String String
-  , body :: Json
-  }
+type Request = { method :: Method, path :: String, headers :: Map String String, body :: Json }
 
 type Response = { status :: Int, body :: Json }
 
@@ -65,8 +60,8 @@ serve ::
   principal ->
   Request ->
   Aff Response
-serve _ guards rt = \principal request ->
-  catchError (dispatch principal request) \_ -> pure (failure 500 "internal error")
+serve _ guards rt = \principal request -> catchError (dispatch principal request) \_ ->
+  pure (failure 500 "internal error")
   where
   table = routes (Proxy :: Proxy rl) guards rt
 
@@ -166,8 +161,7 @@ instance Routes Nil guards rt principal where
 instance ( IsSymbol l
          , Spec spec id s c e r b
          , Newtype id String
-         , RowToList guards grl
-         , Field "serve needs a guard for " l grl (Record commandGuards)
+         , FieldOf "serve needs a guard for " l guards (Record commandGuards)
          , RowToList commandGuards cgl
          , RowToList c crl
          , Covers "a guard names an undeclared command " cgl crl
@@ -194,8 +188,7 @@ instance ( IsSymbol l
 else instance ( IsSymbol l
               , Newtype k String
               , EncodeJson v
-              , RowToList guards grl
-              , Field "serve needs a guard for " l grl (principal -> k -> Boolean)
+              , FieldOf "serve needs a guard for " l guards (principal -> k -> Boolean)
               , Row.Cons l (ViewHandle k v) rtTail rt
               , Routes t guards rt principal
               ) =>
@@ -218,12 +211,11 @@ class GuardTable rl guards principal id where
 instance GuardTable Nil guards principal id where
   guardTable _ _ = Map.empty
 
-instance
-  ( IsSymbol l
-  , Row.Cons l (principal -> id -> Boolean) tail guards
-  , GuardTable t guards principal id
-  ) =>
+instance ( IsSymbol l
+         , Row.Cons l (principal -> id -> Boolean) tail guards
+         , GuardTable t guards principal id
+         ) =>
   GuardTable (Cons l g t) guards principal id where
-  guardTable _ guards = Map.insert (reflectSymbol (Proxy :: Proxy l))
-    (Record.get (Proxy :: Proxy l) guards)
-    (guardTable (Proxy :: Proxy t) guards)
+  guardTable _ guards =
+    Map.insert (reflectSymbol (Proxy :: Proxy l)) (Record.get (Proxy :: Proxy l) guards)
+      (guardTable (Proxy :: Proxy t) guards)

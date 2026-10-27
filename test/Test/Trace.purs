@@ -9,25 +9,30 @@ import Data.Array (index)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Tuple (Tuple(..))
-import Domain (cmd)
+import Domain (command)
 import Domain.Runtime (Span, start)
-import Effect.Aff (Aff)
+import Effect.Aff (Aff, attempt)
 import Effect.Class (liftEffect)
 import Effect.Ref as Ref
-import Test.Support (assertEqual, commandId, fail, recordingOptions)
+import Test.Support (assertEqual, commandId, fail, failingOnce, recordingOptions)
 
 testTrace :: Aff Unit
 testTrace = do
+  outcomes
+  failures
+
+outcomes :: Aff Unit
+outcomes = do
   { options, spans } <- recordingOptions
   rt <- start bank options
   let
     sam = AccountId "a-1"
-  _ <- rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
-  _ <- rt.account.send (commandId "overdraw") sam (cmd @"withdrawMoney" { amount: 5 })
-  _ <- rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
-  _ <- rt.account.send (commandId "open") sam (cmd @"depositMoney" { amount: 5 })
+  _ <- rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" })
+  _ <- rt.account.send (commandId "overdraw") sam (command @"withdrawMoney" { amount: 5 })
+  _ <- rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" })
+  _ <- rt.account.send (commandId "open") sam (command @"depositMoney" { amount: 5 })
   _ <- rt.customer.send (commandId "register") (CustomerId "c-1")
-    (cmd @"registerCustomer" { name: "ada" })
+    (command @"registerCustomer" { name: "ada" })
   rt.stop
   recorded <- liftEffect (Ref.read spans)
   assertEqual "a span per command, the policy's order before the command that caused it"
@@ -73,7 +78,7 @@ testTrace = do
         [ Tuple "command.id" "open"
         , Tuple "command.name" "depositMoney"
         , Tuple "stream.id" "account/a-1"
-        , Tuple "outcome" "conflict"
+        , Tuple "outcome" "reused"
         , Tuple "stored.command" "openAccount"
         , Tuple "policy.orders" "0"
         ]
@@ -87,3 +92,35 @@ testTrace = do
   spanAt n spans = case index spans n of
     Just span -> pure span
     Nothing -> fail ("no span at index " <> show n)
+
+-- | A command that fails still emits its span, with the failure's message,
+-- | whether it fails in its turn or because the runtime is stopped.
+failures :: Aff Unit
+failures = do
+  { options, spans } <- recordingOptions
+  failing <- failingOnce "account/a-1" "the stream is down"
+  rt <- start bank options { beforeTurn = failing }
+  let
+    sam = AccountId "a-1"
+  _ <- attempt
+    (rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" }))
+  rt.stop
+  _ <- attempt (rt.account.send (commandId "late") sam (command @"depositMoney" { amount: 1 }))
+  recorded <- liftEffect (Ref.read spans)
+  assertEqual "each failed command's span carries its failure"
+    [ Map.fromFoldable
+        [ Tuple "command.id" "open"
+        , Tuple "command.name" "openAccount"
+        , Tuple "stream.id" "account/a-1"
+        , Tuple "outcome" "failed"
+        , Tuple "error" "FAIL the stream is down"
+        ]
+    , Map.fromFoldable
+        [ Tuple "command.id" "late"
+        , Tuple "command.name" "depositMoney"
+        , Tuple "stream.id" "account/a-1"
+        , Tuple "outcome" "failed"
+        , Tuple "error" "Domain.Runtime: the runtime is stopped"
+        ]
+    ]
+    (map _.attributes recorded)

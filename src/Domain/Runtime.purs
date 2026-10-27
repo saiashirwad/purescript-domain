@@ -3,7 +3,7 @@
 -- |
 -- | ```purescript
 -- | rt <- start bank defaults
--- | receipt <- rt.account.send commandId accountId (cmd @"depositMoney" { amount: 100 })
+-- | receipt <- rt.account.send commandId accountId (command @"depositMoney" { amount: 100 })
 -- | balance <- rt.summary.read accountId
 -- | rt.stop
 -- | ```
@@ -16,16 +16,11 @@
 module Domain.Runtime
   ( Options
   , Span
-  , Refusal(..)
+  , module Exports
   , defaults
   , start
   , AggregateHandle
   , ViewHandle
-  , class Hosts
-  , makeHosts
-  , class Wire
-  , wire
-  , class FindAggregate
   )
   where
 
@@ -44,29 +39,19 @@ import Data.Symbol (class IsSymbol, reflectSymbol)
 import Data.Time.Duration (Milliseconds)
 import Data.Traversable (for, traverse)
 import Data.Tuple (Tuple(..))
-import Domain
-  ( class Spec
-  , Aggregate
-  , Command
-  , Envelope
-  , Event
-  , Policy
-  , Receipt
-  , Rejection
-  , View
-  , orders
-  , runView
-  , tagOf
-  )
-import Domain.Id (CommandId, StreamId, commandIdText, streamIdText, streamOf, versionNumber)
-import Domain.Stream (Fact, Stored, Stream, Turn(..), open, turn)
+import Domain.Internal.Id
+  (CommandId, StreamId, commandIdText, streamIdText, streamOf, versionNumber)
+import Domain.Internal.Kernel
+  (class Spec, Aggregate, Command, Envelope, Event, Policy, Receipt, View, labelOf, orders, runView)
+import Domain.Internal.Stream (Refusal(..)) as Exports
+import Domain.Internal.Stream (Fact, Refusal(..), Stored, Stream, Turn(..), open, turn)
 import Effect (Effect)
 import Effect.AVar (AVar)
 import Effect.AVar as EffectAVar
 import Effect.Aff (Aff, attempt, bracket, finally, joinFiber, launchAff, throwError)
 import Effect.Aff.AVar as AVar
 import Effect.Class (liftEffect)
-import Effect.Exception (error)
+import Effect.Exception (Error, error, message)
 import Effect.Now as Now
 import Effect.Ref (Ref)
 import Effect.Ref as Ref
@@ -95,20 +80,6 @@ type Options = { now :: Aff Instant, trace :: Span -> Aff Unit, beforeTurn :: St
 
 defaults :: Options
 defaults = { now: liftEffect Now.now, trace: \_ -> pure unit, beforeTurn: \_ -> pure unit }
-
--- | Why `send` did not commit. `Rejected` is the aggregate's answer.
--- | `Reused` means the command id already names another command on this
--- | stream, the one labelled `command`.
-data Refusal spec = Rejected (Rejection spec) | Reused { commandId :: CommandId, command :: String }
-
-instance Eq (Rejection spec) => Eq (Refusal spec) where
-  eq (Rejected x) (Rejected y) = x == y
-  eq (Reused x) (Reused y) = x == y
-  eq _ _ = false
-
-instance Show (Rejection spec) => Show (Refusal spec) where
-  show (Rejected rejected) = "(Rejected " <> show rejected <> ")"
-  show (Reused reused) = "(Reused " <> show reused <> ")"
 
 type AggregateHandle spec id b =
   { send :: CommandId -> id -> Command spec -> Aff (Either (Refusal spec) (Receipt (Event spec) b))
@@ -152,8 +123,8 @@ newSystem options = do
 -- | in-flight count, and the launch share one synchronous effect, so either
 -- | `stop` counts this command or this caller sees the runtime stopped.
 -- | Policy orders skip this: they run inside the work of the command that
--- | caused them.
-submit :: forall a. System -> Aff a -> Aff a
+-- | caused them. `Nothing` means the runtime is stopped.
+submit :: forall a. System -> Aff a -> Aff (Maybe a)
 submit system work = do
   launched <- liftEffect do
     closed <- Ref.read system.closed
@@ -162,9 +133,7 @@ submit system work = do
     else do
       Ref.modify_ (_ + 1) system.inFlight
       Just <$> launchAff (finally (liftEffect leave) (attempt work))
-  case launched of
-    Nothing -> throwError (error "Domain.Runtime: the runtime is stopped")
-    Just fiber -> joinFiber fiber >>= either throwError pure
+  for launched \fiber -> joinFiber fiber >>= either throwError pure
   where
   leave = do
     remaining <- Ref.modify (_ - 1) system.inFlight
@@ -178,13 +147,15 @@ stopSystem system = do
     (_ > 0) <$> Ref.read system.inFlight
   when busy (AVar.read system.idle)
 
--- | One aggregate's streams and subscribers. `handle` is what callers get;
--- | `send` skips `submit` and is for policies only.
+-- | One aggregate's streams and subscribers. `handle` is what callers get.
+-- | `sendOrder` skips `submit`, because an order runs inside the work of the
+-- | command that placed it.
 type Host spec id s b =
   { handle :: AggregateHandle spec id b
-  , send :: CommandId -> id -> Command spec -> Aff (Either (Refusal spec) (Receipt (Event spec) b))
-  , onCommit :: (Array (Fact id s spec) -> Effect (Effect Unit)) -> Effect Unit
-  , afterCommit :: (Array (Envelope id (Event spec)) -> Aff Int) -> Effect Unit
+  , sendOrder ::
+      CommandId -> id -> Command spec -> Aff (Either (Refusal spec) (Receipt (Event spec) b))
+  , subscribeView :: (Array (Fact id s spec) -> Effect (Effect Unit)) -> Effect Unit
+  , subscribePolicy :: (Array (Envelope id (Event spec)) -> Aff Int) -> Effect Unit
   }
 
 newHost ::
@@ -245,11 +216,30 @@ newHost system name aggregate = do
       subscribers <- liftEffect (Ref.read policies)
       sum <$> for subscribers (_ $ envelopes)
 
-    send :: CommandId -> id -> Command spec -> Aff (Either (Refusal spec) (Receipt (Event spec) b))
-    send commandId id sent = do
+    -- Every command emits one span, a failed one included, so the cause of
+    -- a failure that `serve` hides from its client reaches the operator.
+    traced :: CommandId -> id -> Command spec -> Aff (Outcome id s spec b) -> Aff (Answer spec b)
+    traced commandId id sent work = do
+      startedAt <- options.now
+      result <- attempt work
+      finishedAt <- options.now
+      options.trace
+        { name: "command." <> name
+        , startedAt
+        , duration: diff finishedAt startedAt
+        , attributes: attributes commandId (streamOf name (unwrap id)) sent result
+        }
+      case result of
+        Left failure -> throwError failure
+        Right { decided } -> pure case decided of
+          Committed committed -> Right committed.stored.receipt
+          Duplicate stored -> Right stored.receipt
+          Refused refusal -> Left refusal
+
+    send :: CommandId -> id -> Command spec -> Aff (Answer spec b)
+    send commandId id sent = traced commandId id sent do
       let
         stream = streamOf name (unwrap id)
-      startedAt <- options.now
       decided <- holding stream do
         options.beforeTurn stream
         at <- options.now
@@ -257,19 +247,14 @@ newHost system name aggregate = do
       ordered <- case decided of
         Committed committed -> propagate committed.stored.envelopes
         Duplicate stored -> propagate stored.envelopes
-        _ -> pure 0
-      finishedAt <- options.now
-      options.trace
-        { name: "command." <> name
-        , startedAt
-        , duration: diff finishedAt startedAt
-        , attributes: attributes commandId stream sent decided ordered
-        }
-      pure case decided of
-        Committed committed -> Right committed.stored.receipt
-        Duplicate stored -> Right stored.receipt
-        Conflict stored -> Left (Reused { commandId, command: stored.command })
-        Refused refused -> Left (Rejected refused)
+        Refused _ -> pure 0
+      pure { decided, ordered }
+
+    admit :: CommandId -> id -> Command spec -> Aff (Answer spec b)
+    admit commandId id sent = submit system (send commandId id sent) >>= case _ of
+      Just answer -> pure answer
+      Nothing ->
+        traced commandId id sent (throwError (error "Domain.Runtime: the runtime is stopped"))
 
     history :: id -> Aff (Array (Envelope id (Event spec)))
     history id = liftEffect do
@@ -280,11 +265,16 @@ newHost system name aggregate = do
         )
 
   pure
-    { handle: { send: \commandId id sent -> submit system (send commandId id sent), history }
-    , send
-    , onCommit: \subscriber -> Ref.modify_ (_ <> [ subscriber ]) views
-    , afterCommit: \subscriber -> Ref.modify_ (_ <> [ subscriber ]) policies
+    { handle: { send: admit, history }
+    , sendOrder: send
+    , subscribeView: \subscriber -> Ref.modify_ (_ <> [ subscriber ]) views
+    , subscribePolicy: \subscriber -> Ref.modify_ (_ <> [ subscriber ]) policies
     }
+
+type Answer spec b = Either (Refusal spec) (Receipt (Event spec) b)
+
+-- | A finished turn and the number of orders its policies placed.
+type Outcome id s spec b = { decided :: Turn id s spec b, ordered :: Int }
 
 -- | A committed or duplicate command's name and events come from its
 -- | stored receipt, so a span never pairs one command's name with
@@ -295,27 +285,29 @@ attributes ::
   CommandId ->
   StreamId ->
   Command spec ->
-  Turn id s spec b ->
-  Int ->
+  Either Error (Outcome id s spec b) ->
   Map String String
-attributes commandId stream sent decided ordered = Map.fromFoldable
-  ( [ Tuple "command.id" (commandIdText commandId)
-    , Tuple "stream.id" (streamIdText stream)
-    , Tuple "policy.orders" (show ordered)
-    ]
-      <> case decided of
-        Committed committed -> storedAttributes "committed" committed.stored
-        Duplicate stored -> storedAttributes "duplicate" stored
-        Conflict stored ->
-          [ Tuple "command.name" (tagOf sent)
-          , Tuple "outcome" "conflict"
-          , Tuple "stored.command" stored.command
+attributes commandId stream sent result = Map.fromFoldable
+  ( [ Tuple "command.id" (commandIdText commandId), Tuple "stream.id" (streamIdText stream) ]
+      <> case result of
+        Left failure ->
+          [ Tuple "command.name" (labelOf sent)
+          , Tuple "outcome" "failed"
+          , Tuple "error" (message failure)
           ]
-        Refused refused ->
-          [ Tuple "command.name" (tagOf sent)
-          , Tuple "outcome" "rejected"
-          , Tuple "rejection" (tagOf refused)
-          ]
+        Right { decided, ordered } -> [ Tuple "policy.orders" (show ordered) ] <> case decided of
+          Committed committed -> storedAttributes "committed" committed.stored
+          Duplicate stored -> storedAttributes "duplicate" stored
+          Refused (Rejected rejected) ->
+            [ Tuple "command.name" (labelOf sent)
+            , Tuple "outcome" "rejected"
+            , Tuple "rejection" (labelOf rejected)
+            ]
+          Refused (Reused reused) ->
+            [ Tuple "command.name" (labelOf sent)
+            , Tuple "outcome" "reused"
+            , Tuple "stored.command" reused.command
+            ]
   )
   where
   storedAttributes :: String -> Stored id spec b -> Array (Tuple String String)
@@ -323,7 +315,7 @@ attributes commandId stream sent decided ordered = Map.fromFoldable
     [ Tuple "command.name" stored.command
     , Tuple "outcome" outcome
     , Tuple "version" (show (versionNumber stored.receipt.version))
-    , Tuple "events" (intercalate "," (map tagOf stored.receipt.events))
+    , Tuple "events" (intercalate "," (map labelOf stored.receipt.events))
     ]
 
 -- | One row per key. Rows of a keyed view have many writers, one per
@@ -336,7 +328,7 @@ newView ::
   Spec spec id s c e r b => Ord k => View spec k v -> Host spec id s b -> Effect (ViewHandle k v)
 newView definition host = do
   rows <- Ref.new (Map.empty :: Map k v)
-  host.onCommit \facts -> do
+  host.subscribeView \facts -> do
     current <- Ref.read rows
     let
       next = foldl apply current facts
@@ -360,10 +352,10 @@ wirePolicy ::
   Host src sid ss sb ->
   Host tgt tid ts tb ->
   Effect Unit
-wirePolicy name definition source target = source.afterCommit \envelopes -> do
+wirePolicy name definition source target = source.subscribePolicy \envelopes -> do
   let
     addressed = concatMap (orders name definition) envelopes
-  for_ addressed \placed -> target.send placed.commandId placed.to placed.command
+  for_ addressed \placed -> target.sendOrder placed.commandId placed.to placed.command
   pure (length addressed)
 
 -- | Pass one: a host per aggregate entry, keyed by the entry's label.

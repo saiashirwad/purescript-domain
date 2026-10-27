@@ -1,8 +1,9 @@
 #!/bin/bash
 # Applies one common mistake at a time and asserts the compiler's message.
-# Each case names a file, the text to replace, the replacement, and a
-# fragment the compiler output must contain. Files are restored on exit,
-# even on failure. Exit 0 only if every case matches.
+# An `expect` case names a file, the text to replace, the replacement, and
+# a fragment the compiler output must contain. An `expect_module` case is a
+# whole module and a fragment. Files are restored on exit, even on failure.
+# Exit 0 only if every case matches.
 #
 # A case marked KNOWN pins an error that is not yet a one-line custom
 # message. If its text changes, the case fails: that is a regression or an
@@ -17,7 +18,7 @@ restore() {
   for f in ${touched[@]+"${touched[@]}"}; do
     cp "$backup/$(echo "$f" | tr '/' '_')" "$f"
   done
-  rm -rf "$backup"
+  rm -rf "$backup" "$forged"
 }
 trap restore EXIT
 
@@ -34,18 +35,9 @@ open(path, "w").write(text.replace(old, new, 1))
 PY
 }
 
-expect() {
-  local name="$1" file="$2" from="$3" to="$4" fragment="$5" output status
-  touched+=("$file")
-  cp "$file" "$backup/$(echo "$file" | tr '/' '_')"
-  if ! mutate "$file" "$from" "$to"; then
-    echo "FAIL $name: could not apply the mistake"
-    failures=$((failures + 1))
-    return
-  fi
-  output="$(iris build 2>&1)"
-  status=$?
-  cp "$backup/$(echo "$file" | tr '/' '_')" "$file"
+# Asserts that the last build failed with `fragment` in its output.
+check() {
+  local name="$1" fragment="$2"
   if [ "$status" -eq 0 ]; then
     echo "FAIL $name: the mistake compiled"
     failures=$((failures + 1))
@@ -56,6 +48,32 @@ expect() {
   else
     echo "ok   $name"
   fi
+}
+
+expect() {
+  local name="$1" file="$2" from="$3" to="$4" fragment="$5"
+  touched+=("$file")
+  cp "$file" "$backup/$(echo "$file" | tr '/' '_')"
+  if ! mutate "$file" "$from" "$to"; then
+    echo "FAIL $name: could not apply the mistake"
+    failures=$((failures + 1))
+    return
+  fi
+  output="$(iris build 2>&1)"
+  status=$?
+  cp "$backup/$(echo "$file" | tr '/' '_')" "$file"
+  check "$name" "$fragment"
+}
+
+# Builds `source` as a user module of its own, then deletes it.
+forged=test/Test/Forged.purs
+expect_module() {
+  local name="$1" source="$2" fragment="$3"
+  printf '%s\n' "$source" >"$forged"
+  output="$(iris build 2>&1)"
+  status=$?
+  rm -f "$forged"
+  check "$name" "$fragment"
 }
 
 if ! iris build >/dev/null 2>&1; then
@@ -109,11 +127,11 @@ openAccount (Open _) _ = reject @"alreadyOpen" {}' \
 openAccount Unopened { owner } = emit @"accountOpened" { owner }
 openAccount (Open _) _ = reject @"alreadyOpen" unit' \
   "is Unit here but {} in the spec"
-expect "cmd with misspelled label" test/Test/Runtime.purs \
-  'cmd @"depositMoney" { amount: 100 })' 'cmd @"depositMony" { amount: 100 })' \
+expect "command with misspelled label" test/Test/Runtime.purs \
+  'command @"depositMoney" { amount: 100 })' 'command @"depositMony" { amount: 100 })' \
   "the aggregate declares no command depositMony"
 expect "event sent as a command" test/Test/Runtime.purs \
-  '(cmd @"openAccount" { owner: CustomerId "sam" })' '(event @"accountOpened" { owner: CustomerId "sam" })' \
+  '(command @"openAccount" { owner: CustomerId "sam" })' '(event @"accountOpened" { owner: CustomerId "sam" })' \
   "Cannot unify 'Command' with 'Event'"
 expect "missing guard" src/Bank/Api.purs \
   "  , statement: ownsAccount
@@ -127,45 +145,45 @@ expect "misspelled command guard" src/Bank/Api.purs \
   "a guard names an undeclared command depositMony"
 
 # The erased representations are sound only while user code cannot move a
-# value between specs. See "Soundness" in docs/design.md.
-expect "forge an event through its constructor" test/Test/Stream.purs \
-  "import Test.Support (assertEqual, commandId, epoch, fail)
-" "import Test.Support (assertEqual, commandId, epoch, fail)
+# value between specs, even through the internal modules. See "Soundness" in
+# docs/design.md.
+expect_module "forge an event through its constructor" 'module Test.Forged where
+import Bank.Account (Account)
 import Bank.Customer (Customer)
-import Domain (Event(..), event)
-
+import Domain.Internal.Kernel (Event(..), event)
 forged :: Event Account
-forged = case (event @\"customerRegistered\" { name: \"ada\" } :: Event Customer) of
-  Event v -> Event v
-" \
+forged = case (event @"customerRegistered" { name: "ada" } :: Event Customer) of
+  Event v -> Event v' \
   "'Event' is not in scope"
-expect "coerce an event across specs" test/Test/Stream.purs \
-  "import Test.Support (assertEqual, commandId, epoch, fail)
-" "import Test.Support (assertEqual, commandId, epoch, fail)
+expect_module "coerce an event across specs" 'module Test.Forged where
+import Bank.Account (Account)
 import Bank.Customer (Customer)
 import Domain (Event, event)
 import Safe.Coerce (coerce)
-
 forged :: Event Account
-forged = coerce (event @\"customerRegistered\" { name: \"ada\" } :: Event Customer)
-" \
+forged = coerce (event @"customerRegistered" { name: "ada" } :: Event Customer)' \
   "matching 'Customer' with 'Account'"
-expect "event from another spec's row" test/Test/Stream.purs \
-  "import Test.Support (assertEqual, commandId, epoch, fail)
-" "import Test.Support (assertEqual, commandId, epoch, fail)
+expect_module "coerce an aggregate across specs" 'module Test.Forged where
+import Bank.Account (Account)
+import Bank.Customer (customer)
+import Domain (Aggregate)
+import Safe.Coerce (coerce)
+forged :: Aggregate Account
+forged = coerce customer' \
+  "matching 'Customer' with 'Account'"
+expect_module "event from another spec's row" 'module Test.Forged where
+import Bank.Account (Account)
 import Data.Variant (inj)
 import Domain (Event, fromVariant)
 import Type.Proxy (Proxy(..))
-
 forged :: Event Account
-forged = fromVariant (inj (Proxy :: Proxy \"customerRegistered\") { name: \"ada\" })
-" \
+forged = fromVariant (inj (Proxy :: Proxy "customerRegistered") { name: "ada" })' \
   "Cannot unify '( customerRegistered :: { name :: String }"
 
 # KNOWN: not a custom error. The span is the enclosing signature, not the
 # call, and the message names types rather than the label.
-expect "cmd with wrong payload (KNOWN: plain unification error)" test/Test/Runtime.purs \
-  'cmd @"depositMoney" { amount: 100 })' 'cmd @"depositMoney" { amount: "100" })' \
+expect "command with wrong payload (KNOWN: plain unification error)" test/Test/Runtime.purs \
+  'command @"depositMoney" { amount: 100 })' 'command @"depositMoney" { amount: "100" })' \
   "matching '{ amount :: String }' with '{ amount :: Int }'"
 
 # KNOWN: a custom error, but it prints the whole aggregate spec after the

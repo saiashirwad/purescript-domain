@@ -28,8 +28,6 @@ type Movement = { amount :: Int, balanceAfter :: Int }
 
 type Shortfall = { balance :: Int, requested :: Int }
 
--- | Every label the account knows, declared once. The runtime, traces,
--- | codecs, HTTP routes, and smart constructors are all derived from it.
 type Account =
   { id :: AccountId
   , state :: AccountState

@@ -5,12 +5,12 @@ import Prelude
 import Bank.Codec (accountEvents)
 import Bank.Customer (CustomerId(..))
 import Data.Argonaut.Parser (jsonParser)
-import Data.Either (Either(..))
+import Data.Either (Either(..), isLeft)
 import Data.Traversable (traverse)
 import Domain (event)
 import Domain.Codec (decode, encode)
 import Effect.Aff (Aff)
-import Test.Support (assertEqual, assertJson, assertThat, isLeft)
+import Test.Support (assertEqual, assertJson, assertThat)
 
 testCodec :: Aff Unit
 testCodec = do
