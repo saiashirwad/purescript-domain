@@ -121,7 +121,7 @@ expect "missing guard" src/Bank/Api.purs \
   "Missing required properties: statement"
 
 # The erased representations are sound only while user code cannot move a
-# value between specs. See "Soundness" in design/RATIONALE.md.
+# value between specs. See "Soundness" in docs/design.md.
 expect "forge an event through its constructor" test/Test/Stream.purs \
   "import Test.Support (assertEqual, commandId, epoch, fail)
 " "import Test.Support (assertEqual, commandId, epoch, fail)

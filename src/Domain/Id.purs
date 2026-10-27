@@ -1,6 +1,7 @@
--- | Identifiers the runtime owns. Constructors stay private: callers parse
--- | a `CommandId` at the boundary, and the runtime is the only writer of
--- | streams, versions, and sequences.
+-- | Command ids, stream ids, versions, and sequences. Constructors stay
+-- | private, so a `CommandId` comes only from `parseCommandId`, which refuses
+-- | a blank string. `Domain` re-exports what callers need. The stream,
+-- | version, and order-id builders are for the runtime.
 module Domain.Id
   ( CommandId
   , StreamId

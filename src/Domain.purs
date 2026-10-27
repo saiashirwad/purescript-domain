@@ -114,8 +114,8 @@ instance ( RowToList spec fields
 
 -- | A value whose type the spec determines but a type indexed by the spec
 -- | alone cannot name. Every `unsafeCoerce` in the library is in `erase`,
--- | `unerase`, `inject`, and `widen`. Soundness in design/RATIONALE.md says
--- | why each is safe.
+-- | `unerase`, `inject`, and `widen`. Soundness in docs/design.md says why
+-- | each is safe.
 data Erased
 
 -- Sound because only this module erases, and each `unerase` reads the type

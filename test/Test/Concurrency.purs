@@ -31,7 +31,7 @@ testConcurrency = do
   shutdownDrainsCascades
 
 -- | The first command parks in `beforeCommand` until every send is queued, so
--- | the mailbox really holds fifty commands when the stream starts to drain.
+-- | the mailbox really holds forty deposits when the stream starts to drain.
 sameStreamOrder :: Aff Unit
 sameStreamOrder = do
   gate <- AVar.empty
