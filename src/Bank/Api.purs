@@ -4,7 +4,7 @@ module Bank.Api (Principal, guards) where
 
 import Prelude
 
-import Bank.Account (AccountId)
+import Bank.Account (AccountCommand(..), AccountId)
 import Bank.Customer (CustomerId)
 import Data.Maybe (Maybe(..))
 import Data.Set (Set)
@@ -17,11 +17,14 @@ type Principal =
   , accounts :: Set AccountId
   }
 
--- | No signature: `serve` checks each record against its aggregate's
--- | commands, and a signature here would restate them.
+-- | No signature: `serve` checks each guard against its entry's types, and
+-- | a signature here would restate them.
 guards =
-  { account: { openAccount: admin, depositMoney: ownsAccount, withdrawMoney: ownsAccount }
-  , customer: { registerCustomer: admin }
+  { account: \principal id -> case _ of
+      OpenAccount _ -> isAdmin principal
+      DepositMoney _ -> ownsAccount principal id
+      WithdrawMoney _ -> ownsAccount principal id
+  , customer: \principal _ _ -> isAdmin principal
   , summary: ownsAccount
   , statement: ownsAccount
   , dashboard: \principal id -> principal.customer == Just id || isAdmin principal
@@ -29,9 +32,6 @@ guards =
 
 ownsAccount :: Principal -> AccountId -> Boolean
 ownsAccount principal id = Set.member id principal.accounts || isAdmin principal
-
-admin :: forall id. Principal -> id -> Boolean
-admin principal _ = isAdmin principal
 
 isAdmin :: Principal -> Boolean
 isAdmin principal = Set.member "admin" principal.roles

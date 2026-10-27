@@ -1,6 +1,7 @@
--- | JSON codecs derived from the spec. A command, event, or rejection is
--- | encoded as `{ "type": <label>, "value": <payload> }`; payloads use
--- | argonaut's record instances. Versioned payloads read older versions
+-- | JSON codecs. A command, event, or rejection is encoded as
+-- | `{ "type": <label>, "value": <payload> }`, where the label is its
+-- | constructor's name with the first letter lowered; payloads use
+-- | argonaut's instances. Versioned payloads read older versions
 -- | through upcasters.
 module Domain.Codec (Codec, encode, decode, labelled, Upcaster, upcaster, versioned) where
 
@@ -15,10 +16,9 @@ import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Tuple (Tuple(..))
-import Domain.Internal.Codec (class DecodeCases, class EncodeCases, decodeLabelled, encodeLabelled)
-import Domain.Internal.Kernel (class Labelled)
+import Data.Generic.Rep (class Generic)
+import Domain.Internal.Labels (class DecodeCases, class EncodeCases, decodeLabelled, encodeLabelled)
 import Foreign.Object as Object
-import Prim.RowList (class RowToList)
 
 newtype Codec a = Codec { encode :: a -> Json, decode :: Json -> Either String a }
 
@@ -28,10 +28,8 @@ encode (Codec c) = c.encode
 decode :: forall a. Codec a -> Json -> Either String a
 decode (Codec c) = c.decode
 
--- | The codec for `Command spec`, `Event spec`, or `Rejection spec`.
-labelled ::
-  forall a row rl.
-  Labelled a row => RowToList row rl => EncodeCases rl row => DecodeCases rl row => Codec a
+-- | The codec for any type whose constructors take at most one argument.
+labelled :: forall a rep. Generic a rep => EncodeCases rep => DecodeCases rep => Codec a
 labelled = Codec { encode: encodeLabelled, decode: read }
   where
   read value = do

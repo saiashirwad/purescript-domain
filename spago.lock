@@ -24,12 +24,12 @@
             "ordered-collections",
             "partial",
             "prelude",
+            "profunctor",
             "record",
             "refs",
             "strings",
             "tuples",
-            "unsafe-coerce",
-            "variant"
+            "type-equality"
           ]
         },
         "test": {
@@ -1445,22 +1445,6 @@
       "version": "6.0.1",
       "integrity": "sha256-EWQVn1FKBk8WggRQhs+5oYkj5r9BNmb2j1gDITxhH6o=",
       "dependencies": []
-    },
-    "variant": {
-      "type": "registry",
-      "version": "8.0.0",
-      "integrity": "sha256-Ydrgl8liWEwYQOWW76PdZtg3vxKpoKgsnmFyTLgZkoU=",
-      "dependencies": [
-        "control",
-        "enums",
-        "foldable-traversable",
-        "lists",
-        "maybe",
-        "partial",
-        "prelude",
-        "type-equality",
-        "unsafe-coerce"
-      ]
     }
   }
 }

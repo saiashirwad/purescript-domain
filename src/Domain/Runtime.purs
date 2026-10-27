@@ -3,13 +3,14 @@
 -- |
 -- | ```purescript
 -- | rt <- start bank defaults
--- | receipt <- rt.account.send commandId accountId (command @"depositMoney" { amount: 100 })
+-- | receipt <- rt.account.send commandId accountId (DepositMoney { amount: 100 })
 -- | balance <- rt.summary.read accountId
 -- | rt.stop
 -- | ```
 -- |
 -- | An aggregate becomes `{ send, history }`, a view becomes `{ read }`, and
--- | a policy is wired to the aggregates its spec types name. Commands for
+-- | a policy is wired to the aggregates its types name: the one whose events
+-- | it reads and the one whose commands it orders. Commands for
 -- | one stream run one at a time; different streams run concurrently. A view
 -- | applies a stream's events inside that stream's turn, so a read right
 -- | after a send sees the write.
@@ -34,6 +35,7 @@ import Data.Foldable (foldl, for_, sequence_, sum)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
+import Data.Generic.Rep (class Generic)
 import Data.Newtype (class Newtype, unwrap)
 import Data.Symbol (class IsSymbol, reflectSymbol)
 import Data.Time.Duration (Milliseconds)
@@ -41,10 +43,12 @@ import Data.Traversable (for, traverse)
 import Data.Tuple (Tuple(..))
 import Domain.Internal.Id
   (CommandId, StreamId, commandIdText, streamIdText, streamOf, versionNumber)
-import Domain.Internal.Kernel
-  (class Spec, Aggregate, Command, Envelope, Event, Policy, Receipt, View, labelOf, orders, runView)
+import Domain.Fold as Fold
+import Domain.Internal.Kernel (Aggregate, Change, Envelope, Policy, Receipt, View, runView)
+import Domain.Internal.Labels (class LabelOf, labelOf)
 import Domain.Internal.Stream (Refusal(..)) as Exports
-import Domain.Internal.Stream (Fact, Refusal(..), Stored, Stream, Turn(..), open, turn)
+import Domain.Internal.Stream
+  (Fact, Refusal(..), Stored, Stream, Turn(..), change, open, orders, turn)
 import Effect (Effect)
 import Effect.AVar (AVar)
 import Effect.AVar as EffectAVar
@@ -59,6 +63,7 @@ import Partial.Unsafe (unsafeCrashWith)
 import Prim.Row as Row
 import Prim.RowList (class RowToList, Cons, Nil, RowList)
 import Prim.TypeError (class Fail, Above, Beside, Quote, QuoteLabel, Text)
+import Type.Equality (class TypeEquals, to)
 import Record as Record
 import Record.Builder (Builder)
 import Record.Builder as Builder
@@ -81,9 +86,9 @@ type Options = { now :: Aff Instant, trace :: Span -> Aff Unit, beforeTurn :: St
 defaults :: Options
 defaults = { now: liftEffect Now.now, trace: \_ -> pure unit, beforeTurn: \_ -> pure unit }
 
-type AggregateHandle spec id b =
-  { send :: CommandId -> id -> Command spec -> Aff (Either (Refusal spec) (Receipt (Event spec) b))
-  , history :: id -> Aff (Array (Envelope id (Event spec)))
+type AggregateHandle id c e r b =
+  { send :: CommandId -> id -> c -> Aff (Either (Refusal r) (Receipt e b))
+  , history :: id -> Aff (Array (Envelope id e))
   }
 
 type ViewHandle k v = { read :: k -> Aff (Maybe v) }
@@ -150,41 +155,45 @@ stopSystem system = do
 -- | One aggregate's streams and subscribers. `handle` is what callers get.
 -- | `sendOrder` skips `submit`, because an order runs inside the work of the
 -- | command that placed it.
-type Host spec id s b =
-  { handle :: AggregateHandle spec id b
-  , sendOrder ::
-      CommandId -> id -> Command spec -> Aff (Either (Refusal spec) (Receipt (Event spec) b))
-  , subscribeView :: (Array (Fact id s spec) -> Effect (Effect Unit)) -> Effect Unit
-  , subscribePolicy :: (Array (Envelope id (Event spec)) -> Aff Int) -> Effect Unit
+type Host id c e r s b =
+  { handle :: AggregateHandle id c e r b
+  , sendOrder :: CommandId -> id -> c -> Aff (Answer e r b)
+  , subscribeView :: (Array (Fact id e s) -> Effect (Effect Unit)) -> Effect Unit
+  , subscribePolicy :: (Array (Fact id e s) -> Aff Int) -> Effect Unit
   }
 
 newHost ::
-  forall spec id s c e r b.
-  Spec spec id s c e r b =>
+  forall id c crep e erep r rrep s b.
   Newtype id String =>
+  Generic c crep =>
+  LabelOf crep =>
+  Generic e erep =>
+  LabelOf erep =>
+  Generic r rrep =>
+  LabelOf rrep =>
   System ->
   String ->
-  Aggregate spec ->
-  Effect (Host spec id s b)
+  Aggregate id c e r s b ->
+  Effect (Host id c e r s b)
 newHost system name aggregate = do
-  streams <- Ref.new (Map.empty :: Map StreamId (Stream id s spec b))
+  streams <- Ref.new (Map.empty :: Map StreamId (Stream id e s b))
   locks <- Ref.new (Map.empty :: Map StreamId (AVar Unit))
-  views <- Ref.new ([] :: Array (Array (Fact id s spec) -> Effect (Effect Unit)))
-  policies <- Ref.new ([] :: Array (Array (Envelope id (Event spec)) -> Aff Int))
+  views <- Ref.new ([] :: Array (Array (Fact id e s) -> Effect (Effect Unit)))
+  policies <- Ref.new ([] :: Array (Array (Fact id e s) -> Aff Int))
   let
     options = system.options
 
     -- One synchronous effect. Every view computes its next rows before
     -- anything is stored, so the stream and its views change together, or
     -- not at all when a view throws.
-    decide :: CommandId -> id -> StreamId -> Instant -> Command spec -> Effect (Turn id s spec b)
+    decide :: CommandId -> id -> StreamId -> Instant -> c -> Effect (Turn id e r s b)
     decide commandId id stream at sent = do
       current <- fromMaybe (open aggregate stream id) <<< Map.lookup stream <$> Ref.read streams
       let
         decided = turn aggregate at commandId sent current
       case decided of
         Committed committed -> do
-          writes <- Ref.read views >>= traverse (_ $ committed.facts)
+          writes <- Ref.read views >>= traverse (_ $ committed.stored.facts)
           Ref.modify_ (Map.insert stream committed.stream) streams
           sequence_ writes
         _ -> pure unit
@@ -211,14 +220,14 @@ newHost system name aggregate = do
     -- derived command ids, so a retry re-sends an order that a failure
     -- after the commit lost, and the target returns its stored receipt for
     -- an order that already landed.
-    propagate :: Array (Envelope id (Event spec)) -> Aff Int
-    propagate envelopes = do
+    propagate :: Array (Fact id e s) -> Aff Int
+    propagate facts = do
       subscribers <- liftEffect (Ref.read policies)
-      sum <$> for subscribers (_ $ envelopes)
+      sum <$> for subscribers (_ $ facts)
 
     -- Every command emits one span, a failed one included, so the cause of
     -- a failure that `serve` hides from its client reaches the operator.
-    traced :: CommandId -> id -> Command spec -> Aff (Outcome id s spec b) -> Aff (Answer spec b)
+    traced :: CommandId -> id -> c -> Aff (Outcome id e r s b) -> Aff (Answer e r b)
     traced commandId id sent work = do
       startedAt <- options.now
       result <- attempt work
@@ -236,7 +245,7 @@ newHost system name aggregate = do
           Duplicate stored -> Right stored.receipt
           Refused refusal -> Left refusal
 
-    send :: CommandId -> id -> Command spec -> Aff (Answer spec b)
+    send :: CommandId -> id -> c -> Aff (Answer e r b)
     send commandId id sent = traced commandId id sent do
       let
         stream = streamOf name (unwrap id)
@@ -245,18 +254,18 @@ newHost system name aggregate = do
         at <- options.now
         liftEffect (decide commandId id stream at sent)
       ordered <- case decided of
-        Committed committed -> propagate committed.stored.envelopes
-        Duplicate stored -> propagate stored.envelopes
+        Committed committed -> propagate committed.stored.facts
+        Duplicate stored -> propagate stored.facts
         Refused _ -> pure 0
       pure { decided, ordered }
 
-    admit :: CommandId -> id -> Command spec -> Aff (Answer spec b)
+    admit :: CommandId -> id -> c -> Aff (Answer e r b)
     admit commandId id sent = submit system (send commandId id sent) >>= case _ of
       Just answer -> pure answer
       Nothing ->
         traced commandId id sent (throwError (error "Domain.Runtime: the runtime is stopped"))
 
-    history :: id -> Aff (Array (Envelope id (Event spec)))
+    history :: id -> Aff (Array (Envelope id e))
     history id = liftEffect do
       current <- Ref.read streams
       pure
@@ -271,21 +280,26 @@ newHost system name aggregate = do
     , subscribePolicy: \subscriber -> Ref.modify_ (_ <> [ subscriber ]) policies
     }
 
-type Answer spec b = Either (Refusal spec) (Receipt (Event spec) b)
+type Answer e r b = Either (Refusal r) (Receipt e b)
 
 -- | A finished turn and the number of orders its policies placed.
-type Outcome id s spec b = { decided :: Turn id s spec b, ordered :: Int }
+type Outcome id e r s b = { decided :: Turn id e r s b, ordered :: Int }
 
 -- | A committed or duplicate command's name and events come from its
 -- | stored receipt, so a span never pairs one command's name with
 -- | another's events.
 attributes ::
-  forall spec id s c e r b.
-  Spec spec id s c e r b =>
+  forall id c crep e erep r rrep s b.
+  Generic c crep =>
+  LabelOf crep =>
+  Generic e erep =>
+  LabelOf erep =>
+  Generic r rrep =>
+  LabelOf rrep =>
   CommandId ->
   StreamId ->
-  Command spec ->
-  Either Error (Outcome id s spec b) ->
+  c ->
+  Either Error (Outcome id e r s b) ->
   Map String String
 attributes commandId stream sent result = Map.fromFoldable
   ( [ Tuple "command.id" (commandIdText commandId), Tuple "stream.id" (streamIdText stream) ]
@@ -310,7 +324,7 @@ attributes commandId stream sent result = Map.fromFoldable
             ]
   )
   where
-  storedAttributes :: String -> Stored id spec b -> Array (Tuple String String)
+  storedAttributes :: String -> Stored id e s b -> Array (Tuple String String)
   storedAttributes outcome stored =
     [ Tuple "command.name" stored.command
     , Tuple "outcome" outcome
@@ -318,43 +332,45 @@ attributes commandId stream sent result = Map.fromFoldable
     , Tuple "events" (intercalate "," (map labelOf stored.receipt.events))
     ]
 
--- | One row per key. Rows of a keyed view have many writers, one per
+-- | One fold per key. Rows of a keyed view have many writers, one per
 -- | source stream, but each update is computed and stored inside one
 -- | synchronous effect of its stream's turn, so concurrent streams never
 -- | interleave inside an update. A view sees each committed event once: a
 -- | retried command returns its stored receipt without reaching the views.
 newView ::
-  forall spec id s c e r b k v.
-  Spec spec id s c e r b => Ord k => View spec k v -> Host spec id s b -> Effect (ViewHandle k v)
+  forall i id c e r s b k v.
+  TypeEquals (Change id s e) i =>
+  Ord k =>
+  View i k v ->
+  Host id c e r s b ->
+  Effect (ViewHandle k v)
 newView definition host = do
-  rows <- Ref.new (Map.empty :: Map k v)
+  rows <- Ref.new (Map.empty :: Map k (Fold.Fold i v))
   host.subscribeView \facts -> do
     current <- Ref.read rows
     let
-      next = foldl apply current facts
+      next = foldl apply current (map (to <<< change) facts)
     pure (Ref.write next rows)
-  pure { read: \key -> liftEffect (Map.lookup key <$> Ref.read rows) }
+  pure { read: \key -> liftEffect (map Fold.value <<< Map.lookup key <$> Ref.read rows) }
   where
-  fold = runView definition
+  view = runView definition
 
-  apply current { envelope, state } = case fold.key envelope.id state of
+  apply current input = case view.key input of
     Nothing -> current
     Just key ->
-      Map.insert key (fold.step (fromMaybe fold.initial (Map.lookup key current)) envelope.event)
-        current
+      Map.insert key (Fold.step (fromMaybe view.fold (Map.lookup key current)) input) current
 
 wirePolicy ::
-  forall src sid ss sc se sr sb tgt tid ts tc te tr tb.
-  Spec src sid ss sc se sr sb =>
-  Spec tgt tid ts tc te tr tb =>
+  forall i sid sc se sr ss sb tid tc te tr ts tb.
+  TypeEquals (Change sid ss se) i =>
   String ->
-  Policy src tgt ->
-  Host src sid ss sb ->
-  Host tgt tid ts tb ->
+  Policy i tid tc ->
+  Host sid sc se sr ss sb ->
+  Host tid tc te tr ts tb ->
   Effect Unit
-wirePolicy name definition source target = source.subscribePolicy \envelopes -> do
+wirePolicy name policy source target = source.subscribePolicy \facts -> do
   let
-    addressed = concatMap (orders name definition) envelopes
+    addressed = concatMap (orders name policy) facts
   for_ addressed \placed -> target.sendOrder placed.commandId placed.to placed.command
   pure (length addressed)
 
@@ -367,14 +383,19 @@ instance Hosts Nil ctx () where
   makeHosts _ _ _ = pure identity
 
 instance ( IsSymbol l
-         , Spec spec id s c e r b
          , Newtype id String
-         , Row.Cons l (Aggregate spec) ctxTail ctx
+         , Generic c crep
+         , LabelOf crep
+         , Generic e erep
+         , LabelOf erep
+         , Generic r rrep
+         , LabelOf rrep
+         , Row.Cons l (Aggregate id c e r s b) ctxTail ctx
          , Hosts t ctx tailHosts
-         , Row.Cons l (Host spec id s b) tailHosts hosts
+         , Row.Cons l (Host id c e r s b) tailHosts hosts
          , Row.Lacks l tailHosts
          ) =>
-  Hosts (Cons l (Aggregate spec) t) ctx hosts where
+  Hosts (Cons l (Aggregate id c e r s b) t) ctx hosts where
   makeHosts _ ctx system = do
     host <- newHost system (reflectSymbol (Proxy :: Proxy l)) (Record.get (Proxy :: Proxy l) ctx)
     rest <- makeHosts (Proxy :: Proxy t) ctx system
@@ -383,8 +404,8 @@ else instance Hosts t ctx hosts => Hosts (Cons l entry t) ctx hosts where
   makeHosts _ = makeHosts (Proxy :: Proxy t)
 
 -- | Pass two: a handle per aggregate and view, and the policy wiring.
--- | `all` is the whole context, where views and policies find their
--- | aggregates by spec.
+-- | `all` is the whole context, where a view or policy finds the aggregate
+-- | whose events it reads, and a policy the one whose commands it orders.
 class Wire :: RowList Type -> RowList Type -> Row Type -> Row Type -> Row Type -> Constraint
 class Wire rl all ctx hosts rt | rl -> rt where
   wire :: Proxy rl -> Proxy all -> Record ctx -> Record hosts -> Effect (Builder {} (Record rt))
@@ -393,47 +414,47 @@ instance Wire Nil all ctx hosts () where
   wire _ _ _ _ = pure identity
 
 instance ( IsSymbol l
-         , Spec spec id s c e r b
-         , Row.Cons l (Host spec id s b) hostsTail hosts
+         , Row.Cons l (Host id c e r s b) hostsTail hosts
          , Wire t all ctx hosts tailRt
-         , Row.Cons l (AggregateHandle spec id b) tailRt rt
+         , Row.Cons l (AggregateHandle id c e r b) tailRt rt
          , Row.Lacks l tailRt
          ) =>
-  Wire (Cons l (Aggregate spec) t) all ctx hosts rt where
+  Wire (Cons l (Aggregate id c e r s b) t) all ctx hosts rt where
   wire _ all ctx hosts = do
     let
       host = Record.get (Proxy :: Proxy l) hosts
     rest <- wire (Proxy :: Proxy t) all ctx hosts
     pure (Builder.insert (Proxy :: Proxy l) host.handle <<< rest)
 else instance ( IsSymbol l
-              , Spec spec id s c e r b
               , Ord k
-              , FindAggregate spec all source
+              , ChangeOf i e
+              , FindSource e all source
               , IsSymbol source
-              , Row.Cons source (Host spec id s b) hostsTail hosts
-              , Row.Cons l (View spec k v) ctxTail ctx
+              , Row.Cons source (Host id c e r s b) hostsTail hosts
+              , TypeEquals (Change id s e) i
+              , Row.Cons l (View i k v) ctxTail ctx
               , Wire t all ctx hosts tailRt
               , Row.Cons l (ViewHandle k v) tailRt rt
               , Row.Lacks l tailRt
               ) =>
-  Wire (Cons l (View spec k v) t) all ctx hosts rt where
+  Wire (Cons l (View i k v) t) all ctx hosts rt where
   wire _ all ctx hosts = do
     handle <- newView (Record.get (Proxy :: Proxy l) ctx) (Record.get (Proxy :: Proxy source) hosts)
     rest <- wire (Proxy :: Proxy t) all ctx hosts
     pure (Builder.insert (Proxy :: Proxy l) handle <<< rest)
 else instance ( IsSymbol l
-              , Spec src sid ss sc se sr sb
-              , Spec tgt tid ts tc te tr tb
-              , FindAggregate src all source
-              , FindAggregate tgt all target
+              , ChangeOf i se
+              , FindSource se all source
+              , FindTarget tc all target
               , IsSymbol source
               , IsSymbol target
-              , Row.Cons source (Host src sid ss sb) sourceTail hosts
-              , Row.Cons target (Host tgt tid ts tb) targetTail hosts
-              , Row.Cons l (Policy src tgt) ctxTail ctx
+              , Row.Cons source (Host sid sc se sr ss sb) sourceTail hosts
+              , Row.Cons target (Host tid tc te tr ts tb) targetTail hosts
+              , TypeEquals (Change sid ss se) i
+              , Row.Cons l (Policy i tid tc) ctxTail ctx
               , Wire t all ctx hosts rt
               ) =>
-  Wire (Cons l (Policy src tgt) t) all ctx hosts rt where
+  Wire (Cons l (Policy i tid tc) t) all ctx hosts rt where
   wire _ all ctx hosts = do
     wirePolicy (reflectSymbol (Proxy :: Proxy l)) (Record.get (Proxy :: Proxy l) ctx)
       (Record.get (Proxy :: Proxy source) hosts) (Record.get (Proxy :: Proxy target) hosts)
@@ -446,13 +467,31 @@ else instance Fail
   Wire (Cons l entry t) all ctx hosts rt where
   wire _ _ _ _ = unsafeCrashWith "unreachable: rejected at compile time"
 
--- | The label of the aggregate in `rl` whose spec is `spec`.
-class FindAggregate :: Type -> RowList Type -> Symbol -> Constraint
-class FindAggregate spec rl l | spec rl -> l
+-- | The event type of a view's or policy's input, which must be a `Change`.
+class ChangeOf :: Type -> Type -> Constraint
+class ChangeOf i e | i -> e
 
-instance FindAggregate spec (Cons l (Aggregate spec) t) l
-else instance FindAggregate spec t l => FindAggregate spec (Cons m entry t) l
+instance Row.Cons "event" e rest row => ChangeOf (Record row) e
 else instance Fail
-  ( Above (Text "a view or policy reads an aggregate this context does not contain:") (Quote spec)
-  ) =>
-  FindAggregate spec Nil l
+  (Beside (Text "a view or policy must read a Change, not ") (Quote i)) =>
+  ChangeOf i e
+
+-- | The label of the aggregate in `rl` whose events are `e`.
+class FindSource :: Type -> RowList Type -> Symbol -> Constraint
+class FindSource e rl l | e rl -> l
+
+instance FindSource e (Cons l (Aggregate id c e r s b) t) l
+else instance FindSource e t l => FindSource e (Cons m entry t) l
+else instance Fail
+  (Above (Text "a view or policy reads events of an aggregate this context does not contain:") (Quote e)) =>
+  FindSource e Nil l
+
+-- | The label of the aggregate in `rl` whose commands are `c`.
+class FindTarget :: Type -> RowList Type -> Symbol -> Constraint
+class FindTarget c rl l | c rl -> l
+
+instance FindTarget c (Cons l (Aggregate id c e r s b) t) l
+else instance FindTarget c t l => FindTarget c (Cons m entry t) l
+else instance Fail
+  (Above (Text "a policy orders commands of an aggregate this context does not contain:") (Quote c)) =>
+  FindTarget c Nil l

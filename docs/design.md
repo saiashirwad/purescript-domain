@@ -1,59 +1,62 @@
 # Design
 
-This document is for the person who maintains purescript-domain next. It explains the model, what the runtime guarantees and how, why the erased representations are sound, what the library leaves out on purpose, and which compiler limits shaped it. The README has the tutorial. `src/Bank` is the usage spec. If a library change makes bank code worse, the change is wrong.
+This document is for the person who maintains purescript-domain next. It explains the model, what the runtime guarantees and how, what is left unchecked, which compiler errors users see, what the library leaves out on purpose, and which designs came before. The README has the tutorial. `src/Bank` is the usage spec. If a library change makes bank code worse, the change is wrong.
 
 `test/check.sh` is the one gate for every change. It runs `iris test` and requires the line `All tests passed.`, then runs `test/compile-errors.sh` and `test/check-snippets.py`.
 
 ## The model
 
-A user writes each label once, in a spec record type. Every other type takes the spec as its first parameter, and the library derives constructors, dispatch, wiring, routes, codecs, and span names from the spec's rows.
+A user writes commands, events, and rejections as ordinary sum types, and an aggregate as a decider over them. The library reads labels from `Generic` and finds how the pieces of a context connect from their types.
 
-### Spec
+### Labels come from constructor names
 
-A spec is a record type with the fields `id`, `state`, `command`, `event`, `rejection`, and `reply`. `command`, `event`, and `rejection` are variant rows. `class Spec spec id s c e r b | spec -> id s c e r b` in `Domain.Internal.Kernel` projects the record into its parts. Iris rejects a labeled row in an instance head, so the single instance reads the fields from `RowToList spec` through `Field` lookups instead of matching `{ id :: id, ... }`. A missing field fails with `an aggregate spec needs the field reply`.
+Commands, events, and rejections derive `Generic`. `Domain.Internal.Labels` turns a constructor's name into its label by lowering the first letter, so `MoneyDeposited` is `moneyDeposited`. The label names the HTTP route segment, the `command.name` and `rejection` span attributes, the name a receipt stores, and the `"type"` field in JSON. The JSON format is `{ "type": label, "value": payload }`, where the payload is the constructor's one argument through argonaut, or `{}` for a constructor with none. This is the format the previous design wrote, so stored events and clients did not change.
 
-The fundep is what makes the erased representations sound. Each spec fixes exactly one id type, state type, reply type, and row per role, so any two functions constrained on the same spec agree on all of them.
-
-### Commands, events, and rejections
-
-`Command spec`, `Event spec`, and `Rejection spec` are nominal newtypes over an erased variant of the spec's row. Iris has no type families, so `Event Account` cannot be a synonym for the event row. A newtype indexed by the spec is the next best thing, and it makes role mix-ups short. Passing an event where a command belongs reports `Cannot unify 'Command' with 'Event'` instead of two full rows. Users build them with `command @"label"`, `event @"label"`, and `rejection @"label"`, and read them as variants with `toVariant`.
+`LabelOf`, `EncodeCases`, and `DecodeCases` are classes over the `Generic` representation, with instances for `Sum`, `Constructor`, and `NoConstructors`. The `NoConstructors` instances let an aggregate that never rejects use an empty data type, such as `TallyRejection` in `test/Test/Tally.purs`. A constructor with two or more arguments has a `Product` representation, and the `Product` instances end in `Fail` with the message `a labelled constructor takes at most one argument; put its fields in a record`.
 
 ### Aggregate
 
-`aggregate { initial, decide, evolve, reply }` takes handler records keyed by label and walks each record's `RowList` once. It checks every label against the spec and builds a dispatch table, a `Map` from label to handler. At run time, dispatch reads the variant's tag and looks up the handler.
+`Aggregate id c e r s b` is a newtype over a decider record: `initial :: s`, `decide :: c -> s -> Either r (Array e)`, `evolve :: s -> e -> s`, and `reply :: s -> b`. `id` appears only in the type. It names the aggregate's streams, and the runtime requires `Newtype id String`.
 
-- `decide` must cover every command and `evolve` every event (`Covers`).
-- Each `decide` handler returns a `Decision r e`, whose rows are the rejections and events that handler may produce. `SubRow` proves each narrow row is a sub-row of the spec's row with the same payload types, so widening it is a coercion.
-- `reply` computes the reply from the state after the command.
+`decide` and `evolve` are ordinary functions, usually a `case` with no wildcard over the command or event. The compiler's exhaustiveness check then does the job that `Covers` and `DecideTable` did in the previous design: a new command or event fails the build at every function that has not handled it.
 
-`commit` decides and folds the new events into the state. `replay` is a fold over `evolve`. `test/Test/Replay.purs` checks two QuickCheck properties: the fold law `replay a s (xs <> ys) == replay a (replay a s xs) ys`, and that any run of commands leaves the bank's balance equal to the sum of its movements and never negative.
+`commit` in `Domain.Internal.Kernel` decides and folds the new events into the state, keeping the state after each event. `replay` is a fold over `evolve`. `test/Test/Replay.purs` checks two QuickCheck properties: the fold law `replay a s (xs <> ys) == replay a (replay a s xs) ys`, and that any run of commands leaves the bank's balance equal to the sum of its movements and never negative.
 
-### View
+### Views are folds
 
-`View spec k v` is a read model with one row of `v` per key `k`. Its handlers name any subset of the spec's events. Without a `key` field, `k` is the aggregate's id. With `key :: s -> Maybe k`, the runtime calls `key` with the aggregate's state right after each event, and `Nothing` skips the event. The bank's dashboard uses `key: customerOf` to fold every account a customer owns into one row, so `moneyDeposited` does not need to carry the customer.
+`Domain.Fold` defines `Fold i o`, a left fold as a value: its current result and the fold it becomes after one more input. It is a `Functor`, an `Applicative`, and a `Profunctor`. `fold` builds one from an initial value and a step, `foldMap` from a function into a monoid, `premap` adapts its input, and `run` runs it over a `Foldable`. `test/Test/Fold.purs` covers the instances.
 
-Two other key sources were rejected:
+A view's input is a `Change id s e`, the record `{ id, state, event }`: a committed event, the id of its stream, and the stream's state right after it. `View i k v` pairs a fold with a key function `i -> Maybe k`. The runtime keeps one fold per key and steps it with each change routed to that key. `Nothing` skips the change. `byId` keys by the change's `id`. `keyed` takes any key function.
+
+The bank's dashboard uses `keyed (customerOf <<< _.state)` to fold every account a customer owns into one row, so `MoneyDeposited` does not need to carry the customer. Two other key sources were rejected:
 
 - Deriving the key from the id, as in `AccountId { customer, number }`, needs a library-defined text codec for every id, freezes ownership, and makes every account id name a customer.
-- Learning a routing table from `accountOpened` repeats inside the view a fold of ownership that `evolve` already does, and it is hidden state per view.
+- Learning a routing table from `AccountOpened` repeats inside the view a fold of ownership that `evolve` already does, and it is hidden state per view.
 
-The aggregate's state is its own answer to "who owns this account", so the chosen key cannot disagree with the write model, and the view keeps no state beyond its rows. `ViewDefinition` is an instance chain over the definition's fields. It enforces the optional `key`, the key's type, and the rule that a view without a key has `k` equal to the source id, each with its own one-line error.
+The aggregate's state is its own answer to "who owns this account", so the key cannot disagree with the write model, and the view keeps no state beyond its rows.
 
 ### Policy
 
-`Policy src tgt` reacts to events of the `src` spec by placing orders on the `tgt` spec. A handler returns `order @"label" targetId payload` values. The runtime derives each order's command id from the event that caused it, so the user never invents one, and a retry derives the same ids again. The runtime guarantees below describe the id format.
+`Policy i id c` wraps a function from a change to an array of orders, where an order is `{ to :: id, command :: c }`. The user never gives an order a command id. `orders` in `Domain.Internal.Stream` derives one for each order from the event that caused it, and the runtime's `wirePolicy` calls it. A retry derives the same ids again. The runtime guarantees below describe the id format.
 
 ### Context
 
 A context is a record of aggregates, views, and policies, such as `bank = { account, customer, summary, statement, dashboard, provisioning }`. Each entry's label names its stream category (`account/a-1`), its span (`command.account`), its runtime handle (`rt.account`), and its HTTP route prefix (`/account`).
 
-`start` makes two type-level passes over the context. `Hosts` builds one host per aggregate entry. `Wire` turns each aggregate into `{ send, history }` and each view into `{ read }`, and subscribes each view and policy to the aggregate whose spec matches (`FindAggregate`, an instance chain with a non-linear head). Typing views and policies by spec, not by label, keeps every module type-checkable without the context. `start` reserves the label `stop` for the shutdown action.
+`start` in `Domain.Runtime` makes two type-level passes over the context. `Hosts` builds one host per aggregate entry. `Wire` turns each aggregate into `{ send, history }` and each view into `{ read }`, and subscribes each view and policy to its aggregates. The wiring finds them by type, not by label:
+
+- `ChangeOf` reads the event type from the `event` field of a view's or policy's input record.
+- `FindSource` finds the aggregate in the context whose event type is that type.
+- `FindTarget` finds the aggregate whose command type is the policy's command type.
+- `TypeEquals (Change id s e) i` then proves that the input is exactly that aggregate's `Change`.
+
+Finding aggregates by type keeps every module type-checkable without the context. `start` reserves the label `stop` for the shutdown action.
 
 ### Derived boundaries
 
 - `Domain.Story` runs given/when/then steps against the pure aggregate, with no runtime. The `emits` steps after a command must list its events exactly, in order, so a story cannot pass while the command emits an event it does not mention.
-- `Domain.Codec.labelled` encodes a command, event, or rejection as `{ "type": label, "value": payload }`. Its halves, `encodeLabelled` and `decodeLabelled` in `Domain.Internal.Codec`, each need only their own direction's argonaut instances, so an event payload served over HTTP needs no `DecodeJson`. `decodeLabelled` takes the label and the payload apart, which is how a route receives them. `versioned` wraps a codec with a version number and upcasters, and applies them one version at a time, so a version older than every upcaster fails at its first lookup. `Bank.Codec.accountEvents` upcasts version 1 deposits.
-- `Domain.Http.serve` routes `POST /<aggregate>/<id>/<command>` with an `Idempotency-Key` header to `send`, and `GET /<view>/<key>` to `read`. The only hand-written input is the guards. An aggregate's guard is a record with one predicate per command label, checked against the spec in both directions, so a missing or misspelled command is a compile error that names it. A view's guard is one predicate. Every predicate takes the principal and the id or key, not the payload, so one predicate such as `ownsAccount` serves commands and views alike. A rule about the payload, such as a positive amount, belongs in `decide`. Any exception inside the runtime becomes a 500 with a fixed body, so an internal message never reaches the client. The runtime has already reported the exception: every command emits a span, and a failed command's span carries the message (see the span section below). `serve` needs no reporting parameter of its own.
+- `Domain.Codec.labelled` is the labelled JSON codec for any type with a `Generic` instance whose constructors take at most one argument. `versioned` wraps a codec with a version number and upcasters, and applies them one version at a time, so a version older than every upcaster fails at its first lookup. `Bank.Codec.accountEvents` upcasts version 1 deposits.
+- `Domain.Http.serve` routes `POST /<aggregate>/<id>/<command>` with an `Idempotency-Key` header to `send`, and `GET /<view>/<key>` to `read`. The only hand-written input is the guards. An aggregate's guard is `principal -> id -> command -> Boolean`, and the bank writes it as a `case` over the command with no wildcard, so a new command needs a decision about who may send it. A view's guard is `principal -> key -> Boolean`. `serve` decodes the command from the route's command segment and the body before it calls the guard, so a body that does not decode is a 400, even for a principal the guard would refuse. A missing guard is a compile error that names the label, and so is a guard whose label names no aggregate or view of the context. Any exception inside the runtime becomes a 500 with a fixed body, so an internal message never reaches the client. The runtime has already reported the exception: every command emits a span, and a failed command's span carries the message.
 
 ## Runtime guarantees
 
@@ -61,7 +64,7 @@ A context is a record of aggregates, views, and policies, such as `bank = { acco
 
 ### Each command commits once per stream
 
-A stream keeps its receipts in its own state, keyed by command id, and each receipt records the label of the command that made it. Sending a command id that the stream has already committed for the same label returns the stored receipt and appends nothing, even if the payload differs. Sending it with another label is an error the caller sees: `send` returns `Left (Reused { commandId, command })`, where `command` names the stored command, and HTTP answers 422. The same id sent to another stream is a different command and commits there. A refusal stores nothing, so the same id is decided again later and may commit. `test/Test/Runtime.purs` covers each case. `test/Test/Stream.purs` pins the format of a derived order id, because a stream stores receipts under it.
+A stream keeps its receipts in its own state, keyed by command id, and each receipt records the label of the command that made it. Sending a command id that the stream has already committed for the same label returns the stored receipt and appends nothing, even if the payload differs. Sending it with another label is an error the caller sees: `send` returns `Left (Reused { commandId, command })`, where `command` names the stored command, and HTTP answers 422. The same id sent to another stream is a different command and commits there. A refusal stores nothing, so the same id is decided again later and may commit. `test/Test/Runtime.purs` covers each case. `test/Test/Stream.purs` pins the format of a derived order id through `orders`, because a stream stores receipts under it.
 
 A `CommandId` is either a client's key, from `parseCommandId`, or an id the runtime derives for a policy's order. The two kinds never compare equal, whatever their text, so a client that sends the key `provisioning:customer/c-1@1#0` cannot claim that order's id and suppress it. `clientsCannotClaimOrderIds` in `test/Test/Tally.purs` covers this with a tally, whose bumps are not idempotent by themselves.
 
@@ -69,7 +72,7 @@ A `CommandId` is either a client's key, from `parseCommandId`, or an id the runt
 
 Each stream has a lock, an `AVar Unit` that a turn takes before it starts and puts back when it ends. An `AVar` serves waiting takes first come, first served, so commands on one stream are decided in the order they reach the lock. With a synchronous `now`, as in `defaults`, that is the order of the `send` calls. Different streams have different locks and run concurrently. The lock covers `beforeTurn` and the turn itself. It does not cover the policy dispatch, so an order can target any stream, the source stream included, without deadlock.
 
-`test/Test/Concurrency.purs` sends 40 deposits to one held stream and checks that they commit in send order with no gaps in the sequence. A second test checks that a command sent to a held stream does not start its turn until the stream is free. A third holds two streams inside `beforeTurn` at the same time, which would deadlock if the runtime serialized across streams.
+`sameStreamOrder` in `test/Test/Concurrency.purs` sends 40 deposits to one held stream and checks that they commit in send order with no gaps in the sequence. `busyStreamWaits` checks that a command sent to a held stream does not start its turn until the stream is free. `differentStreamsOverlap` holds two streams inside `beforeTurn` at the same time, which would deadlock if the runtime serialized across streams.
 
 ### An accepted command finishes without its caller
 
@@ -87,15 +90,15 @@ Every point at which a caller can be killed leads to the same outcome:
 
 ### Views update in the same step as the commit
 
-The host stores the committed stream and applies every view in one synchronous `Effect`. Each view first computes its next rows from its current rows and the committed events, each with the stream's state right after it. The host stores the stream and the new rows only after every view has computed, so if a view throws, nothing is stored, and the caller sees the error. A read right after `send` returns sees the write, and no receipt a caller can hold is ahead of the views. A retried command returns its stored receipt without reaching the views, so a view sees each committed event once. `failingViewCommitsNothing` in `test/Test/Tally.purs` checks that a view that throws leaves the stream and the other views unchanged.
+The host stores the committed stream and applies every view in one synchronous `Effect`. Each view first computes its next folds from its current folds and the committed changes. The host stores the stream and the new folds only after every view has computed, so if a view throws, nothing is stored, and the caller sees the error. A read right after `send` returns sees the write, and no receipt a caller can hold is ahead of the views. A retried command returns its stored receipt without reaching the views, so a view sees each committed event once. `failingViewCommitsNothing` in `test/Test/Tally.purs` checks that a view that throws leaves the stream and the other views unchanged.
 
-Dispatch tables are `Map`s from label to handler, so a label such as `valueOf` or `constructor` dispatches like any other label, and a view that does not name it skips it. `prototypeLabels` in `test/Test/Tally.purs` covers this.
+The runtime handles a label only as a string: in a stored receipt, in a span, and as a key of the HTTP route `Map`. A constructor named `ValueOf` or `Constructor` labels as `valueOf` or `constructor`, which are names on every JavaScript object, and behaves like any other. `prototypeLabels` in `test/Test/Tally.purs` covers the runtime and the codec, and `test/Test/Http.purs` covers a route named `constructor`.
 
 A keyed row, such as a customer's dashboard, has one writer per source stream, and those streams run concurrently. They never interleave inside one update, because each update is one synchronous effect. The rows of a keyed view therefore update in commit order across streams, not in a per-row sequence. The dashboard sums deltas, so its result is the same in every order. An order-sensitive fold across accounts would see the interleaving.
 
 ### Policy orders have derived ids
 
-Each order's command id is `policy:stream@seq#index`, for example `provisioning:customer/c-1@1#0`. Including the policy label and the source stream keeps two policies that react to one event from colliding. A retried command reruns the policies over its stored envelopes. The derived ids are the same, so the target returns its stored receipt for an order that already committed, and sends nothing twice. `derivedOrderIds` in `test/Test/Tally.purs` checks this with a tally, which would count a re-sent order twice.
+Each order's command id is `policy:stream@seq#index`, for example `provisioning:customer/c-1@1#0`. Including the policy label and the source stream keeps two policies that react to one event from colliding. A retried command reruns the policies over its stored facts. The derived ids are the same, so the target returns its stored receipt for an order that already committed, and sends nothing twice. `derivedOrderIds` in `test/Test/Tally.purs` checks this with a tally, which would count a re-sent order twice.
 
 The same rerun heals a lost order. If the dispatch fails after the commit, for example because the target's `beforeTurn` fails, the caller sees the failure, and the order is missing. Retrying the triggering command with its id sends the order again. `retryHealsALostOrder` covers this.
 
@@ -107,82 +110,62 @@ A failing `beforeTurn` aborts its command before the commit and reaches the call
 
 ### Each command emits one span
 
-The span is named `command.<label>`. Its attributes are `command.id`, `command.name`, `stream.id`, and `outcome`, which is `committed`, `duplicate`, `reused`, `rejected`, or `failed`. Every outcome but `failed` adds `policy.orders`. A committed or duplicate span adds `version` and `events`, and takes `command.name` from the stored receipt. A reused span adds `stored.command`, the command that the id already names. A rejected span adds `rejection`. A failed span adds `error`, the exception's message. A command fails when a hook, a view, or one of its orders throws, or when it arrives after `stop`. The runtime takes every other value from labels, so no user code lists them. `test/Test/Trace.purs` covers each outcome.
+The span is named `command.<aggregate>`. Its attributes are `command.id`, `command.name`, `stream.id`, and `outcome`, which is `committed`, `duplicate`, `reused`, `rejected`, or `failed`. Every outcome but `failed` adds `policy.orders`. A committed or duplicate span adds `version` and `events`, and takes `command.name` from the stored receipt. A reused span adds `stored.command`, the command that the id already names. A rejected span adds `rejection`. A failed span adds `error`, the exception's message. A command fails when a hook, a view, or one of its orders throws, or when it arrives after `stop`. The runtime takes every other value from labels, so no user code lists them. `test/Test/Trace.purs` covers each outcome.
 
-## Soundness
+## What is unchecked
 
-`Domain.Internal.Kernel` has four `unsafeCoerce` calls, one in each of four unexported helpers. The rest of the kernel is type-checked. `Domain` re-exports part of the kernel and adds nothing.
+The library has no `unsafeCoerce`. Every value has the type it was built with, so no invariant has to hold for the types to be true. Two unchecked operations remain:
 
-| Helper | What it does | Why it is sound |
-|---|---|---|
-| `erase`, `unerase` | Store a value as `Erased` and read it back. | Each `Erased` is read back at the type it was written with. The next table lists every pair. |
-| `inject` | Build a `Variant row` from a label and a payload. | `Field` proves that the label carries that payload type in `row`. |
-| `widen` | Turn a handler's narrow row into the spec's row. | `SubRow` proves that each narrow label is in the spec's row with the same payload. |
+- `guardOf` in `Domain.Http` reads a guard with `Record.Unsafe.unsafeGet`. The `HasGuard` instance chain has already proved, from `RowToList guards`, that the record has a field with that label and that type. A `Row.Cons` constraint would make the read checked, but it reports a missing guard as a unification of the whole guards row instead of `serve needs a guard for statement`.
+- The `Fail` instance at the end of the `Wire` chain has the body `unsafeCrashWith "unreachable: rejected at compile time"`, which no program that compiles can reach.
 
-`Erased` stands in for a type that the spec determines but that a newtype indexed by the spec alone cannot name. Each pair below writes one field and reads it back.
-
-| Written by | Read by | Type at both ends |
-|---|---|---|
-| `fromVariant` | `toVariant` | `Variant c`, `Variant e`, or `Variant r`, inside `Command`, `Event`, or `Rejection` |
-| `aggregate` | `decider` | `Decider spec s b`, inside `Aggregate` |
-| `view` | `runView` | the key, `id -> s -> Maybe k`, inside `View` |
-| `policy` | `orders` | the handler table, `Map String (id -> Erased -> Array (Order tgt))`, inside `Policy` |
-| `order` | `orders` | the target id, inside `Order` |
-| `untag` | the handler that `table` or `decideTable` stored under that label | the payload of the variant's own label |
-
-The invariant is that the spec fixes every type in the last column. Three facts enforce it, each in one place:
-
-1. `class Spec spec id s c e r b | spec -> id s c e r b` gives each spec exactly one id, state, reply, and row per role. Both ends of the first five pairs have a `Spec` constraint on the same spec, so they agree on the type. The last pair depends on labels instead, as the last item of the next list explains.
-2. `Domain.Internal.Kernel` exports no constructor of `Command`, `Event`, `Rejection`, `Aggregate`, `View`, `Policy`, or `Order`, and does not export `Erased` or the helpers. Only the kernel can write an `Erased`, and that holds for code that imports the internal modules too.
-3. Each of those newtypes declares its spec parameter `nominal` with `type role`, so `coerce` cannot move a value from one spec to another.
-
-These changes would break it:
-
-- Exporting a constructor. User code could unwrap an `Event Customer` and rewrap its contents as an `Event Account`.
-- Deleting a `type role` line. `Safe.Coerce.coerce` could do the same.
-- Weakening `Spec` so that a spec no longer fixes its parts. Two ends of a pair could then disagree on `s` or on a row. Deleting the fundep outright fails the library's own build.
-- Storing a `table` or `decideTable` handler under a key other than the label that its `Field` check used. A handler would then read a payload of the wrong type. Both builders key each handler by `reflectSymbol` of that label.
-
-`test/compile-errors.sh` asserts the first two from user code, with each attempt as a module of its own. With `Event(..)` exported from the kernel, the case "forge an event through its constructor", which imports `Domain.Internal.Kernel`, compiles and fails. With `type role Event nominal` deleted, the case "coerce an event across specs" compiles and fails, and with `type role Aggregate nominal` deleted, so does "coerce an aggregate across specs". A third case asserts that `fromVariant` rejects another spec's row. It guards the fundeps on `Spec` and `Labelled`. Deleting either one fails the library's own build first, so no one-line change makes that case fail alone.
-
-Two other unchecked operations exist outside the table. `Domain.Http` reads each guard with `Record.Unsafe.unsafeGet`, by the same label for which `Field` has already proved that the guard exists with the right type. Every instance that ends a chain with `Fail` has a body of `unsafeCrashWith "unreachable: rejected at compile time"`, which no program that compiles can reach.
+The `NoConstructors` instances in `Domain.Internal.Labels` recurse on their argument. No value of an empty type exists, so they never run.
 
 ## Compiler errors
 
-The rule behind legible errors is that no `Prim.Row` constraint ever sees a label that an instance chain has not checked first. Every label check ends in an instance chain in `Domain.Internal.Labels` whose last instance fails with a custom message that names the label. Before the rule, a missing handler printed `CannotUnify` and two `Union` failures around the custom message.
+A missing case is the compiler's own error. Iris reports the missing patterns as a `MissingPatterns` warning that names the constructor, and the build fails with `No instance found for: Partial` at the same position, because the function's signature has no `Partial` constraint. `guards` in `src/Bank/Api.purs` has no signature, so a missing case there makes `guards` itself partial. The warning stays in `Api.purs`, and the error lands at each call to `serve`.
 
-`test/compile-errors.sh` applies one mistake at a time to the bank, builds, asserts a fragment of the error, and restores the file. To add a case, add an `expect` line with the file, the text to replace, the replacement, and the expected fragment, or an `expect_module` line with a whole module and the fragment. A compiler error block in the README must quote the fragment of an `expect` case, and `test/check-snippets.py` checks its source line against that case's mistake. A case marked `KNOWN` pins an error that is not yet a one-line custom message. Two remain. A `command` with a payload of the wrong type prints a plain unification error at the enclosing signature. A view over an aggregate missing from the context prints the whole spec after its header.
+Every other mistake the library can name ends in an instance chain whose last instance fails with a custom message:
 
-A `decide` handler without a type signature also gives an illegible error, `No instance found for: RowToList @Type ...`, because Iris cannot infer the narrow rows. The library accepts that cost, because the signature is where a handler documents what it may produce.
+- `HasGuard`: `serve needs a guard for <label>`.
+- `KnownGuards`: `a guard names no aggregate or view of the context: <label>`.
+- The `Product` instances in `Domain.Internal.Labels`: `a labelled constructor takes at most one argument; put its fields in a record`. The error appears where the library first needs the codec, such as a call to `serve`, not at the data declaration.
+- `Wire`: `a context entry must be an Aggregate, a View, or a Policy, but <label> is <type>`.
+- `ChangeOf`: `a view or policy must read a Change, not <type>`.
+- `FindSource` and `FindTarget`: `a view or policy reads events of an aggregate this context does not contain:` and `a policy orders commands of an aggregate this context does not contain:`, each above the type. A `NoInstanceFound` for a `Row.Cons` over the hosts row follows the custom message.
+
+`test/compile-errors.sh` applies one mistake at a time to the bank, builds, asserts a fragment of the output, and restores the file. To add a case, add an `expect` line with the file, the text to replace, the replacement, and the expected fragment. A compiler error block in the README must quote the fragment of an `expect` case and point into that case's file, and `test/check-snippets.py` checks its source line against that case's mistake. A case marked `KNOWN` pins an error that is not yet a one-line custom message. Two remain. An event sent where a command belongs prints `Cannot unify 'AccountEvent' with 'AccountCommand'` at the enclosing signature. A view whose key type disagrees with its key function prints a plain unification error.
 
 ## What the library does not do
 
-- **Sagas.** A policy maps one event to orders and keeps no state, which is what lets its order ids be derived from the event alone. A process that waits on several events can be an aggregate of its own.
+- **Sagas.** A policy maps one change to orders and keeps no state, which is what lets its order ids be derived from the event alone. A process that waits on several events can be an aggregate of its own.
 - **A durable store.** No durable backend exists to test the shape against, and an append that returns `Aff` would split today's single synchronous step that stores a commit and applies its views. The open questions below sketch the seam.
 - **An HTTP client.** No PureScript caller of the API exists to shape one. A client can encode commands with `Domain.Codec.labelled`, which is the format `serve` reads.
 - **`purs` compatibility.** The library targets Iris only. It is built and tested with Iris 0.1.13, and `test/compile-errors.sh` asserts Iris's exact error text, which `purs` renders differently.
-- **Views over two aggregates.** A view reads one aggregate's events. A row over two aggregates needs two views.
+- **Views over two aggregates.** A view reads one aggregate's changes. A row over two aggregates needs two views.
 
-## Iris limits that shaped the design
+## Iris limits that still apply
 
-- **No type families.** A type indexed by the spec cannot compute the spec's rows, so `Command`, `Event`, `Rejection`, `Aggregate`, `View`, `Policy`, and `Order` are nominal newtypes over `Erased`, and the Soundness section exists.
-- **No labeled rows in instance heads.** `instance Spec { id :: id } id` fails with `[InstanceHeadLabeledRow] ... Only the ( | r ) form is allowed`. The `Spec` instance reads fields through `RowToList` instead.
-- **What Iris does allow.** Visible type applications give `command @"depositMoney"`. Instance chains with `Prim.TypeError.Fail` give the custom errors. Non-linear instance heads give `FindAggregate`, which matches a context entry whose spec equals the view's spec.
+- **No labeled rows in instance heads.** An instance head such as `{ event :: e | r }` fails with `[InstanceHeadLabeledRow]`. `ChangeOf` matches `Record row` and reads the `event` field with a `Row.Cons` constraint instead.
+- **No type families.** The wiring cannot compute "the aggregate whose events are `e`" as a type. `FindSource` and `FindTarget` search the context's `RowList` with an instance chain and a functional dependency instead.
+- **What Iris does allow.** Instance chains with `Prim.TypeError.Fail` give the custom errors. Non-linear instance heads give `FindSource`, `FindTarget`, and `HasGuard`, which match an entry whose type or label equals the one sought. A module can export a function whose constraint names a class it does not export, so `start` and `serve` keep `Hosts`, `Wire`, `FindSource`, `FindTarget`, `ChangeOf`, `Routes`, `HasGuard`, and `KnownGuards` private.
 
 ## Tradeoffs accepted
 
-- Four `unsafeCoerce` calls in the kernel buy one-parameter types and short errors. They are sound only while the three facts under Soundness hold.
-- Every `decide` handler needs a signature, in exchange for narrow rows that document and guarantee what each handler produces.
-- Dispatch goes through a label-keyed `Map` with an unreachable fallback, so that no `Row.Cons` sees an unchecked label.
+- A handler's type no longer says what it may produce. In the previous design, a deposit handler's signature proved it could not return `insufficientFunds`. Now `decide` returns any `AccountRejection`. Stories test what each command produces instead.
+- A constructor takes at most one argument, so a payload with several fields is a record.
+- A label is a constructor's name, so renaming a constructor of an event changes the stored format. A rename needs an upcaster in the event codec, as `Bank.Codec.accountEvents` does for version 1 deposits.
+- A missing case prints two messages, a warning and an error about `Partial`, instead of one custom line. In exchange, the check is the compiler's own and needs no library class.
+- Views and policies find aggregates by event and command type. If two aggregates in one context share an event type, every view over that type reads the first of them in label order, and the same holds for a shared command type and policy targets.
 - `start` reserves the label `stop`, in exchange for a flat `rt.account.send`.
-- Every view has a third type parameter (`View Account AccountId Summary`), so that one view type covers keyed and unkeyed views and its signature says what `read` takes.
+- Every view has three type parameters (`View AccountChange AccountId Summary`), so that one view type covers keyed and unkeyed views and its signature says what `read` takes.
 - A keyed row's update order across streams is commit order, as described under the runtime guarantees.
 
 ## Alternatives considered
 
-- **Derive the rows from the handler records, with no spec type.** Event payload types would come from lambda inference, rejection rows from a `Nub` of unions, and every view and policy would need the source rows before the context exists. Errors would read as row unification.
-- **Keep raw `Variant` rows with a type synonym per role.** This needs no erasure, but signatures go back to positional rows, and a role mix-up prints two full rows instead of `Command` versus `Event`.
-- **Name a view's source by label (`view @"account"`).** This avoids the `FindAggregate` search, but a view could not type-check its handlers until the context exists.
+- **Declare once, in a spec record type.** This was the previous design. A spec was a record type with the fields `id`, `state`, `command`, `event`, `rejection`, and `reply`, where the three middle fields were variant rows. `aggregate` took handler records keyed by label, and a view was a record of handlers with an optional `key` field that the library detected by the record's shape. Each handler's narrow `Decision` row was checked against the spec. Two problems decided against it. First, label-keyed handler records and a field detected by shape read like a TypeScript options bag, not like PureScript. Second, `Command spec`, `Event spec`, and the other spec-indexed types could not compute the spec's rows without type families, so they were newtypes over an erased representation, read back through four `unsafeCoerce` helpers. Their soundness rested on a functional dependency, unexported constructors, and nominal type roles, with compile-error cases that tried to forge an event. Plain ADTs and a decider remove all of that machinery and keep the wire format.
+- **Raw `Variant` rows.** Commands as `Variant (openAccount :: ..., ...)` give per-handler narrow rows for free. But every use site spells the label as a string (`inj @"openAccount"`), and coverage needs library classes instead of the compiler's exhaustiveness check.
+- **Name a view's source by label (`view @"account"`).** This avoids the `FindSource` search, but a view could not type-check until the context exists.
 
 ## Open questions
 
@@ -194,29 +177,29 @@ A durable store would sit behind the host as a record of capabilities, with the 
 2. **Append with an expected version.** Write a commit's envelopes only if the stream is still at the version the turn started from. A mismatch means another writer got there first.
 3. **Rebuild receipts from history.** Every envelope carries its `commandId`. Grouping a stream's envelopes by command id gives each receipt's events and version, and replaying up to the last envelope of each group gives its reply. A receipt also keeps the label of its command, which no envelope carries, so the store must write it with each commit. A stored command id must keep its kind, client or derived, because a client key can have the same text as a derived id. Refusals are never stored, so nothing else is needed.
 
-The event format would be the versioned `Codec (Event spec)` that `Bank.Codec.accountEvents` already round-trips. The envelope fields (`seq`, `commandId`, `at`) still need a codec.
+The event format would be the versioned `Codec AccountEvent` that `Bank.Codec.accountEvents` already round-trips. The envelope fields (`seq`, `commandId`, `at`) still need a codec.
 
 The cost is the guarantee that a commit and its view updates happen in one synchronous step. An append that returns `Aff` lets a crash or a reader land between the write and the view update. Views would then need their own position in each stream and a way to catch up on restart. Until a real backend needs the store, that cost buys nothing.
 
 ### Others
 
 - Should a policy's rejected order surface somewhere other than its span, such as a dead-letter handle on `rt`?
-- Can two aggregates in one context share a spec? `FindAggregate` takes the first match.
+- Should two aggregates in one context be allowed to share an event type? `FindSource` takes the first match in label order.
 
 ## Modules
 
 | Module | What it owns |
 |---|---|
-| `Domain` | The user's view of the kernel and the ids: specs, labelled values, aggregates, views, policies, envelopes, receipts, and command ids. Re-exports only. |
+| `Domain` | The user's view of the kernel and the ids: aggregates, changes, views, policies, envelopes, receipts, command ids, and `labelOf`. Re-exports only. |
+| `Domain.Fold` | Left folds as values, which views run. |
 | `Domain.Story` | Given/when/then stories against the pure aggregate. |
 | `Domain.Runtime` | The host around `turn`, with per-stream locks, runtime-owned command fibers, views, policies, spans, and `stop`. |
 | `Domain.Codec` | Labelled and versioned JSON codecs. |
 | `Domain.Http` | Routes, status codes, and guards over a transport-neutral request. |
-| `Domain.Internal.Kernel` | Everything `Domain` re-exports, plus what the other modules need and users do not: `Decider`, `runView`, `orders`, `labelOf`. The four coercion helpers. Pure. |
-| `Domain.Internal.Labels` | The label checks behind the custom compile errors. |
+| `Domain.Internal.Kernel` | `Aggregate`, `commit`, `replay`, `Change`, `View`, `Policy`, `Order`, `Envelope`, and `Receipt`. Pure. |
+| `Domain.Internal.Labels` | Labels from `Generic`, and the labelled JSON encoding and decoding. |
 | `Domain.Internal.Id` | Command ids, stream ids, versions, sequences, and derived order ids. |
-| `Domain.Internal.Stream` | One command's turn on one stream, as a pure function. |
-| `Domain.Internal.Codec` | The encode and decode halves of the labelled codec. |
+| `Domain.Internal.Stream` | One command's turn on one stream, and the orders a policy places for one fact, as pure functions. |
 | `Bank`, `Bank.*` | The example bank, which is also the usage spec. |
 
-User code imports the first five. Iris lets a module export a function whose constraint names a class it does not export, so `start`, `serve`, `aggregate`, and `view` keep their plumbing classes (`Hosts`, `Wire`, `FindAggregate`, `Routes`, `DecideTable`, `Table`, `ViewDefinition`) private.
+User code imports the first six.

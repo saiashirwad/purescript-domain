@@ -5,15 +5,14 @@ module Bank.Codec (accountEvents) where
 
 import Prelude
 
-import Bank.Account (Account)
+import Bank.Account (AccountEvent)
 import Data.Argonaut.Core (Json, fromObject, toObject, toString)
 import Data.Either (Either, note)
 import Data.Maybe (Maybe(..))
-import Domain (Event)
 import Domain.Codec (Codec, labelled, upcaster, versioned)
 import Foreign.Object as Object
 
-accountEvents :: Codec (Event Account)
+accountEvents :: Codec AccountEvent
 accountEvents = versioned 2 [ upcaster 1 addBalanceAfter ] labelled
 
 addBalanceAfter :: Json -> Either String Json

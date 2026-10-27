@@ -5,19 +5,23 @@ module Test.Tally (testTally) where
 
 import Prelude
 
-import Bank.Customer (Customer, CustomerId(..), customer)
+import Bank.Customer (CustomerChange, CustomerCommand(..), CustomerId(..), customer)
 import Data.Array (length)
 import Data.Either (Either(..), isLeft)
+import Data.Generic.Rep (class Generic)
 import Data.Maybe (Maybe(..), fromJust)
+import Data.Traversable (traverse)
 import Data.Newtype (class Newtype)
-import Data.Variant (Variant)
-import Domain
-  (Aggregate, Decision, Policy, View, aggregate, command, emit, order, parseCommandId, policy, view)
+import Data.Show.Generic (genericShow)
+import Domain (Aggregate(..), Change, Policy(..), View, byId, parseCommandId)
+import Domain.Codec (decode, encode, labelled)
+import Domain.Fold as Fold
+import Domain.Internal.Stream (Refusal(..))
 import Domain.Runtime (start)
 import Effect.Aff (Aff, attempt)
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import Test.Support
-  (assertEqual, assertThat, commandId, expectRight, fail, failingOnce, testOptions)
+  (assertEqual, assertJson, assertThat, commandId, expectRight, fail, failingOnce, testOptions)
 
 newtype TallyId = TallyId String
 
@@ -26,45 +30,62 @@ derive newtype instance Eq TallyId
 derive newtype instance Ord TallyId
 derive newtype instance Show TallyId
 
--- | `toString`, `valueOf`, and `__proto__` are also names on every JavaScript
--- | object.
-type Tally =
-  { id :: TallyId
-  , state :: Int
-  , command :: Variant (bump :: {}, toString :: {}, "__proto__" :: {})
-  , event :: Variant (bumped :: {}, valueOf :: {})
-  , rejection :: Variant ()
-  , reply :: Int
-  }
+-- | `ValueOf` and `Constructor` label as `valueOf` and `constructor`, which
+-- | are also names on every JavaScript object.
+data TallyCommand = Bump | ValueOf | Constructor
 
-tally :: Aggregate Tally
-tally = aggregate
+derive instance Eq TallyCommand
+derive instance Generic TallyCommand _
+instance Show TallyCommand where
+  show = genericShow
+
+data TallyEvent = Bumped | ToString
+
+derive instance Eq TallyEvent
+derive instance Generic TallyEvent _
+instance Show TallyEvent where
+  show = genericShow
+
+-- | A tally never rejects.
+data TallyRejection
+
+derive instance Eq TallyRejection
+derive instance Generic TallyRejection _
+instance Show TallyRejection where
+  show = genericShow
+
+type Tally = Aggregate TallyId TallyCommand TallyEvent TallyRejection Int Int
+
+type TallyChange = Change TallyId Int TallyEvent
+
+tally :: Tally
+tally = Aggregate
   { initial: 0
-  , decide: { bump, toString, "__proto__": proto }
-  , evolve: { bumped: \n _ -> n + 1, valueOf: \n _ -> n }
+  , decide: \sent _ -> Right (eventsOf sent)
+  , evolve: \n -> case _ of
+      Bumped -> n + 1
+      ToString -> n
   , reply: identity
   }
   where
-  bump :: Int -> {} -> Decision () (bumped :: {})
-  bump _ _ = emit @"bumped" {}
+  eventsOf = case _ of
+    Bump -> [ Bumped ]
+    ValueOf -> [ ToString ]
+    Constructor -> [ Bumped ]
 
-  proto :: Int -> {} -> Decision () (bumped :: {})
-  proto _ _ = emit @"bumped" {}
-
-  toString :: Int -> {} -> Decision () (valueOf :: {})
-  toString _ _ = emit @"valueOf" {}
-
--- | Ignores `valueOf`.
-bumps :: View Tally TallyId Int
-bumps = view { initial: 0, on: { bumped: \n _ -> n + 1 } }
+-- | Ignores `ToString`.
+bumps :: View TallyChange TallyId Int
+bumps = byId $ Fold.fold 0 \n { event } -> case event of
+  Bumped -> n + 1
+  ToString -> n
 
 -- | Throws on the second bump of a tally.
-fragile :: View Tally TallyId Int
-fragile = view
-  { initial: 0, on: { bumped: \n _ -> if n >= 1 then unsafeCrashWith "fragile view" else n + 1 } }
+fragile :: View TallyChange TallyId Int
+fragile = byId $ Fold.fold 0 \n _ ->
+  if n >= 1 then unsafeCrashWith "fragile view" else n + 1
 
-counted :: Policy Customer Tally
-counted = policy { customerRegistered: \_ _ -> [ order @"bump" target {} ] }
+counted :: Policy CustomerChange TallyId TallyCommand
+counted = Policy \_ -> [ { to: target, command: Bump } ]
 
 target :: TallyId
 target = TallyId "t"
@@ -85,7 +106,7 @@ derivedOrderIds = do
   let
     ada = CustomerId "c-1"
     registerAda =
-      rt.customer.send (commandId "register") ada (command @"registerCustomer" { name: "ada" })
+      rt.customer.send (commandId "register") ada (RegisterCustomer { name: "ada" })
   _ <- expectRight "register" =<< registerAda
   _ <- expectRight "retry register" =<< registerAda
   counts <- rt.tally.history target
@@ -101,7 +122,7 @@ retryHealsALostOrder = do
   let
     ada = CustomerId "c-1"
     registerAda =
-      rt.customer.send (commandId "register") ada (command @"registerCustomer" { name: "ada" })
+      rt.customer.send (commandId "register") ada (RegisterCustomer { name: "ada" })
   lost <- attempt registerAda
   assertThat "the caller sees the failed order" (isLeft lost)
   registered <- rt.customer.history ada
@@ -120,34 +141,50 @@ clientsCannotClaimOrderIds = do
   rt <- start { customer, tally, counted } testOptions
   let
     spoofed = unsafePartial (fromJust (parseCommandId "counted:customer/c-1@1#0"))
-  _ <- expectRight "client bump" =<< rt.tally.send spoofed target (command @"bump" {})
+  _ <- expectRight "client bump" =<< rt.tally.send spoofed target Bump
   _ <- expectRight "register" =<< rt.customer.send (commandId "register") (CustomerId "c-1")
-    (command @"registerCustomer" { name: "ada" })
+    (RegisterCustomer { name: "ada" })
   counts <- rt.tally.history target
   assertEqual "the client's bump and the policy's bump both count" 2 (length counts)
   rt.stop
 
--- | Labels that name `Object.prototype` members dispatch like any other.
+-- | Constructors labelled like `Object.prototype` members behave like any
+-- | other: the runtime stores the label as the command's name, and the codec
+-- | reads it back.
 prototypeLabels :: Aff Unit
 prototypeLabels = do
   rt <- start { tally, bumps } testOptions
-  _ <- expectRight "toString" =<< rt.tally.send (commandId "poke") target (command @"toString" {})
-  _ <- expectRight "bump" =<< rt.tally.send (commandId "bump") target (command @"bump" {})
-  _ <-
-    expectRight "__proto__" =<< rt.tally.send (commandId "proto") target (command @"__proto__" {})
+  _ <- expectRight "valueOf" =<< rt.tally.send (commandId "poke") target ValueOf
+  _ <- expectRight "bump" =<< rt.tally.send (commandId "bump") target Bump
+  _ <- expectRight "constructor" =<< rt.tally.send (commandId "ctor") target Constructor
+  retried <- rt.tally.send (commandId "poke") target ValueOf
+  _ <- expectRight "a retried valueOf is a duplicate, not a new command" retried
+  reused <- rt.tally.send (commandId "poke") target Constructor
+  case reused of
+    Left (Reused { command }) -> assertEqual "a reused id names the stored label" "valueOf" command
+    _ -> fail "an id stored for valueOf was reusable by constructor"
   history <- rt.tally.history target
-  assertEqual "every command committed" 3 (length history)
+  assertEqual "every command committed once" 3 (length history)
   row <- rt.bumps.read target
   assertEqual "a view skips an event it does not name" (Just 2) row
   rt.stop
+
+  assertJson "a valueOf command encodes under its label"
+    """{"type":"valueOf","value":{}}""" (encode labelled ValueOf)
+  assertEqual "valueOf and constructor decode to their constructors"
+    (Right [ ValueOf, Constructor ])
+    ( traverse (decode labelled <<< encode labelled) [ ValueOf, Constructor ]
+    )
+  assertEqual "toString decodes as an event" (Right ToString)
+    (decode labelled (encode labelled ToString))
 
 -- | A view that throws fails the command, and the commit does not land
 -- | without its views.
 failingViewCommitsNothing :: Aff Unit
 failingViewCommitsNothing = do
   rt <- start { tally, bumps, fragile } testOptions
-  _ <- expectRight "first bump" =<< rt.tally.send (commandId "one") target (command @"bump" {})
-  broken <- attempt (rt.tally.send (commandId "two") target (command @"bump" {}))
+  _ <- expectRight "first bump" =<< rt.tally.send (commandId "one") target Bump
+  broken <- attempt (rt.tally.send (commandId "two") target Bump)
   case broken of
     Left _ -> pure unit
     Right _ -> fail "a throwing view did not fail the command"

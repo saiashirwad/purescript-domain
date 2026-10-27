@@ -2,11 +2,12 @@ module Test.Stories (testStories) where
 
 import Prelude
 
-import Bank.Account (account)
+import Bank.Account (AccountCommand(..), AccountEvent(..), AccountRejection(..), account)
 import Bank.Customer (CustomerId(..))
 import Data.Either (Either(..))
-import Data.Variant (Variant)
-import Domain (Aggregate, Decision, aggregate, emit)
+import Data.Generic.Rep (class Generic)
+import Data.Show.Generic (genericShow)
+import Domain (Aggregate(..))
 import Domain.Story (emits, given, rejects, replies, sends, story)
 import Effect.Aff (Aff)
 import Test.Support (fail)
@@ -14,63 +15,64 @@ import Test.Support (fail)
 testStories :: Aff Unit
 testStories = do
   expectStory "deposits into an open account and replies with the balance" $ story account
-    [ given @"accountOpened" { owner: CustomerId "sam" }
-    , sends @"depositMoney" { amount: 100 }
-    , emits @"moneyDeposited" { amount: 100, balanceAfter: 100 }
+    [ given (AccountOpened { owner: CustomerId "sam" })
+    , sends (DepositMoney { amount: 100 })
+    , emits (MoneyDeposited { amount: 100, balanceAfter: 100 })
     , replies { balance: 100 }
     ]
   expectStory "refuses to withdraw more than the balance" $ story account
-    [ given @"accountOpened" { owner: CustomerId "sam" }
-    , given @"moneyDeposited" { amount: 100, balanceAfter: 100 }
-    , sends @"withdrawMoney" { amount: 150 }
-    , rejects @"insufficientFunds" { balance: 100, requested: 150 }
+    [ given (AccountOpened { owner: CustomerId "sam" })
+    , given (MoneyDeposited { amount: 100, balanceAfter: 100 })
+    , sends (WithdrawMoney { amount: 150 })
+    , rejects (InsufficientFunds { balance: 100, requested: 150 })
     ]
   expectStory "refuses a deposit into an account that is not open"
-    $ story account [ sends @"depositMoney" { amount: 100 }, rejects @"notOpen" {} ]
+    $ story account [ sends (DepositMoney { amount: 100 }), rejects NotOpen ]
   expectStory "refuses a deposit of zero" $ story account
-    [ given @"accountOpened" { owner: CustomerId "sam" }
-    , sends @"depositMoney" { amount: 0 }
-    , rejects @"nonPositiveAmount" { amount: 0 }
+    [ given (AccountOpened { owner: CustomerId "sam" })
+    , sends (DepositMoney { amount: 0 })
+    , rejects (NonPositiveAmount { amount: 0 })
     ]
   expectStory "refuses a negative withdrawal" $ story account
-    [ given @"accountOpened" { owner: CustomerId "sam" }
-    , given @"moneyDeposited" { amount: 100, balanceAfter: 100 }
-    , sends @"withdrawMoney" { amount: -50 }
-    , rejects @"nonPositiveAmount" { amount: -50 }
+    [ given (AccountOpened { owner: CustomerId "sam" })
+    , given (MoneyDeposited { amount: 100, balanceAfter: 100 })
+    , sends (WithdrawMoney { amount: -50 })
+    , rejects (NonPositiveAmount { amount: -50 })
     ]
   expectStory "refuses to open an account twice" $ story account
-    [ given @"accountOpened" { owner: CustomerId "sam" }
-    , sends @"openAccount" { owner: CustomerId "kim" }
-    , rejects @"alreadyOpen" {}
+    [ given (AccountOpened { owner: CustomerId "sam" })
+    , sends (OpenAccount { owner: CustomerId "kim" })
+    , rejects AlreadyOpen
     ]
   expectFailure "a story with the wrong expected event fails" $ story account
-    [ given @"accountOpened" { owner: CustomerId "sam" }
-    , sends @"depositMoney" { amount: 100 }
-    , emits @"moneyDeposited" { amount: 100, balanceAfter: 999 }
+    [ given (AccountOpened { owner: CustomerId "sam" })
+    , sends (DepositMoney { amount: 100 })
+    , emits (MoneyDeposited { amount: 100, balanceAfter: 999 })
     ]
   expectStory "the emits steps after a command list all its events"
-    $ story twice [ sends @"bumpTwice" {}, emits @"bumped" {}, emits @"bumped" {}, replies 2 ]
+    $ story twice [ sends BumpTwice, emits Bumped, emits Bumped, replies 2 ]
   expectFailure "a story that leaves an emitted event unlisted fails"
-    $ story twice [ sends @"bumpTwice" {}, emits @"bumped" {}, replies 2 ]
+    $ story twice [ sends BumpTwice, emits Bumped, replies 2 ]
   expectFailure "a story that lists an event the command did not emit fails" $ story twice
-    [ sends @"bumpTwice" {}, emits @"bumped" {}, emits @"bumped" {}, emits @"bumped" {} ]
+    [ sends BumpTwice, emits Bumped, emits Bumped, emits Bumped ]
 
 -- | One command that emits two events.
-type Twice =
-  { id :: Unit
-  , state :: Int
-  , command :: Variant (bumpTwice :: {})
-  , event :: Variant (bumped :: {})
-  , rejection :: Variant ()
-  , reply :: Int
-  }
+data TwiceCommand = BumpTwice
 
-twice :: Aggregate Twice
-twice = aggregate
-  { initial: 0, decide: { bumpTwice }, evolve: { bumped: \n _ -> n + 1 }, reply: identity }
-  where
-  bumpTwice :: Int -> {} -> Decision () (bumped :: {})
-  bumpTwice _ _ = emit @"bumped" {} <> emit @"bumped" {}
+data Bumped = Bumped
+
+derive instance Eq Bumped
+derive instance Generic Bumped _
+instance Show Bumped where
+  show = genericShow
+
+twice :: Aggregate Unit TwiceCommand Bumped Void Int Int
+twice = Aggregate
+  { initial: 0
+  , decide: \BumpTwice _ -> Right [ Bumped, Bumped ]
+  , evolve: \n Bumped -> n + 1
+  , reply: identity
+  }
 
 expectStory :: forall s. String -> Either String s -> Aff Unit
 expectStory label = case _ of

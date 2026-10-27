@@ -3,13 +3,12 @@ module Test.Trace (testTrace) where
 import Prelude
 
 import Bank (bank)
-import Bank.Account (AccountId(..))
-import Bank.Customer (CustomerId(..))
+import Bank.Account (AccountCommand(..), AccountId(..))
+import Bank.Customer (CustomerCommand(..), CustomerId(..))
 import Data.Array (index)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Tuple (Tuple(..))
-import Domain (command)
 import Domain.Runtime (Span, start)
 import Effect.Aff (Aff, attempt)
 import Effect.Class (liftEffect)
@@ -27,12 +26,12 @@ outcomes = do
   rt <- start bank options
   let
     sam = AccountId "a-1"
-  _ <- rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" })
-  _ <- rt.account.send (commandId "overdraw") sam (command @"withdrawMoney" { amount: 5 })
-  _ <- rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" })
-  _ <- rt.account.send (commandId "open") sam (command @"depositMoney" { amount: 5 })
+  _ <- rt.account.send (commandId "open") sam (OpenAccount { owner: CustomerId "sam" })
+  _ <- rt.account.send (commandId "overdraw") sam (WithdrawMoney { amount: 5 })
+  _ <- rt.account.send (commandId "open") sam (OpenAccount { owner: CustomerId "sam" })
+  _ <- rt.account.send (commandId "open") sam (DepositMoney { amount: 5 })
   _ <- rt.customer.send (commandId "register") (CustomerId "c-1")
-    (command @"registerCustomer" { name: "ada" })
+    (RegisterCustomer { name: "ada" })
   rt.stop
   recorded <- liftEffect (Ref.read spans)
   assertEqual "a span per command, the policy's order before the command that caused it"
@@ -103,9 +102,9 @@ failures = do
   let
     sam = AccountId "a-1"
   _ <- attempt
-    (rt.account.send (commandId "open") sam (command @"openAccount" { owner: CustomerId "sam" }))
+    (rt.account.send (commandId "open") sam (OpenAccount { owner: CustomerId "sam" }))
   rt.stop
-  _ <- attempt (rt.account.send (commandId "late") sam (command @"depositMoney" { amount: 1 }))
+  _ <- attempt (rt.account.send (commandId "late") sam (DepositMoney { amount: 1 }))
   recorded <- liftEffect (Ref.read spans)
   assertEqual "each failed command's span carries its failure"
     [ Map.fromFoldable

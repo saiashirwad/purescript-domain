@@ -2,12 +2,12 @@ module Test.Codec (testCodec) where
 
 import Prelude
 
+import Bank.Account (AccountEvent(..))
 import Bank.Codec (accountEvents)
 import Bank.Customer (CustomerId(..))
 import Data.Argonaut.Parser (jsonParser)
 import Data.Either (Either(..), isLeft)
 import Data.Traversable (traverse)
-import Domain (event)
 import Domain.Codec (decode, encode)
 import Effect.Aff (Aff)
 import Test.Support (assertEqual, assertJson, assertThat)
@@ -15,11 +15,11 @@ import Test.Support (assertEqual, assertJson, assertThat)
 testCodec :: Aff Unit
 testCodec = do
   let
-    deposited = event @"moneyDeposited" { amount: 40, balanceAfter: 40 }
+    deposited = MoneyDeposited { amount: 40, balanceAfter: 40 }
     events =
-      [ event @"accountOpened" { owner: CustomerId "sam" }
+      [ AccountOpened { owner: CustomerId "sam" }
       , deposited
-      , event @"moneyWithdrawn" { amount: 15, balanceAfter: 25 }
+      , MoneyWithdrawn { amount: 15, balanceAfter: 25 }
       ]
   assertEqual "every stored event round-trips" (Right events)
     (traverse (decode accountEvents <<< encode accountEvents) events)
@@ -31,7 +31,7 @@ testCodec = do
         =<< jsonParser """{"version":1,"payload":{"type":"moneyDeposited","value":{"amount":40}}}"""
     )
   assertEqual "version 1 events the upcaster does not touch decode unchanged"
-    (Right (event @"accountOpened" { owner: CustomerId "sam" }))
+    (Right (AccountOpened { owner: CustomerId "sam" }))
     ( decode accountEvents
         =<< jsonParser
               """{"version":1,"payload":{"type":"accountOpened","value":{"owner":"sam"}}}"""

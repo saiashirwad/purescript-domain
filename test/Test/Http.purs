@@ -111,6 +111,9 @@ testHttp = do
   assertEqual "a keyed view route rejects POST with 405" 405 wrongMethodDashboard.status
   strangerCommand <- post sam "/account/a-2/depositMoney" "k-steal" (encodeJson { amount: 1 })
   assertEqual "a command guard denies another's account" 403 strangerCommand.status
+  strangerBadPayload <- post sam "/account/a-2/depositMoney" "k-bad-3" (encodeJson { amount: "lots" })
+  assertEqual "the guard sees the decoded command, so a malformed one is 400 before it is 403" 400
+    strangerBadPayload.status
   register <- post sam "/customer/c-9/registerCustomer" "k-reg" (encodeJson { name: "sam" })
   assertEqual "only admins register customers" 403 register.status
   adminRegister <- post admin "/customer/c-9/registerCustomer" "k-reg" (encodeJson { name: "sam" })

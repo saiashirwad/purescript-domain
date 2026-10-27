@@ -2,13 +2,12 @@ module Test.Replay (testReplay) where
 
 import Prelude
 
-import Bank.Account (Account, AccountState(..), account)
+import Bank.Account (AccountCommand(..), AccountEvent(..), AccountState(..), account)
 import Bank.Customer (CustomerId(..))
 import Data.Array.NonEmpty (cons')
 import Data.Either (Either(..))
 import Data.Foldable (foldl, sum)
-import Data.Variant (match)
-import Domain (Command, Event, command, commit, event, replay, toVariant)
+import Domain (commit, replay)
 import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
 import Test.QuickCheck (quickCheck, (===))
@@ -17,26 +16,24 @@ import Test.QuickCheck.Gen (Gen, arrayOf, chooseInt, elements, oneOf)
 genOwner :: Gen CustomerId
 genOwner = CustomerId <$> elements (cons' "sam" [ "kim", "ada" ])
 
-genEvent :: Gen (Event Account)
-genEvent = oneOf (cons' (opened <$> genOwner) [ movement moneyDeposited, movement moneyWithdrawn ])
+genEvent :: Gen AccountEvent
+genEvent = oneOf (cons' (AccountOpened <$> owner) [ movement MoneyDeposited, movement MoneyWithdrawn ])
   where
-  opened owner = event @"accountOpened" { owner }
-  moneyDeposited movement' = event @"moneyDeposited" movement'
-  moneyWithdrawn movement' = event @"moneyWithdrawn" movement'
+  owner = (\o -> { owner: o }) <$> genOwner
   movement make = do
     amount <- chooseInt 0 1000
     balanceAfter <- chooseInt 0 5000
     pure (make { amount, balanceAfter })
 
-genCommand :: Gen (Command Account)
+genCommand :: Gen AccountCommand
 genCommand = oneOf
-  ( cons' (openAccount <$> genOwner)
-      [ depositMoney <$> chooseInt (-100) 1000, withdrawMoney <$> chooseInt (-100) 1000 ]
+  ( cons' (OpenAccount <$> owner)
+      [ deposit <$> chooseInt (-100) 1000, withdraw <$> chooseInt (-100) 1000 ]
   )
   where
-  openAccount owner = command @"openAccount" { owner }
-  depositMoney amount = command @"depositMoney" { amount }
-  withdrawMoney amount = command @"withdrawMoney" { amount }
+  owner = (\o -> { owner: o }) <$> genOwner
+  deposit amount = DepositMoney { amount }
+  withdraw amount = WithdrawMoney { amount }
 
 genState :: Gen AccountState
 genState = oneOf
@@ -76,7 +73,8 @@ testReplay = liftEffect do
     Left _ -> acc
     Right committed -> { state: committed.state, events: acc.events <> committed.events }
 
-  movement :: Event Account -> Int
-  movement =
-    match { accountOpened: \_ -> 0, moneyDeposited: _.amount, moneyWithdrawn: negate <<< _.amount }
-      <<< toVariant
+  movement :: AccountEvent -> Int
+  movement = case _ of
+    AccountOpened _ -> 0
+    MoneyDeposited { amount } -> amount
+    MoneyWithdrawn { amount } -> negate amount

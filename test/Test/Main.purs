@@ -8,6 +8,7 @@ import Effect.Class (liftEffect)
 import Effect.Console (log)
 import Test.Codec (testCodec)
 import Test.Concurrency (testConcurrency)
+import Test.Fold (testFold)
 import Test.Http (testHttp)
 import Test.Replay (testReplay)
 import Test.Runtime (testRuntime)
@@ -18,6 +19,7 @@ import Test.Trace (testTrace)
 
 main :: Effect Unit
 main = launchAff_ do
+  testFold
   testStories
   testReplay
   testCodec

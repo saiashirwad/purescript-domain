@@ -20,12 +20,12 @@ package:
     - ordered-collections
     - partial
     - prelude
+    - profunctor
     - record
     - refs
     - strings
     - tuples
-    - unsafe-coerce
-    - variant
+    - type-equality
   test:
     main: Test.Main
     dependencies:

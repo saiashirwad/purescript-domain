@@ -1,21 +1,18 @@
--- | Declare an aggregate's labels once, in a spec record type:
+-- | Write an aggregate as plain data and functions:
 -- |
 -- | ```purescript
--- | type Account =
--- |   { id :: AccountId, state :: AccountState
--- |   , command :: Variant (depositMoney :: { amount :: Int }, ...)
--- |   , event :: Variant (moneyDeposited :: Movement, ...)
--- |   , rejection :: Variant (notOpen :: {}, ...)
--- |   , reply :: { balance :: Int }
--- |   }
+-- | data AccountCommand = OpenAccount { owner :: CustomerId } | DepositMoney { amount :: Int } | ...
+-- | data AccountEvent = AccountOpened { owner :: CustomerId } | MoneyDeposited Movement | ...
+-- |
+-- | account :: Aggregate AccountId AccountCommand AccountEvent AccountRejection AccountState Balance
+-- | account = Aggregate { initial: Unopened, decide, evolve, reply }
 -- | ```
 -- |
--- | Every other type takes that spec as its first parameter: `Aggregate
--- | Account`, `Command Account`, `View Account AccountId Summary`, `Policy
--- | Customer Account`. Handlers are records keyed by label. The library walks
--- | them against the spec, so a missing or misspelled handler is one compile
--- | error that names the label.
-module Domain (module Domain.Internal.Kernel, module Domain.Internal.Id) where
+-- | Commands, events, and rejections derive `Generic`; a constructor's name,
+-- | first letter lowered, is its label in routes, spans, and JSON. Views are
+-- | folds from `Domain.Fold`, keyed with `byId` or `keyed`. Policies are
+-- | functions from a change to orders.
+module Domain (module Domain.Internal.Kernel, module Domain.Internal.Id, module Domain.Internal.Labels) where
 
 import Domain.Internal.Id
   ( CommandId
@@ -29,29 +26,16 @@ import Domain.Internal.Id
   , versionNumber
   )
 import Domain.Internal.Kernel
-  ( class Labelled
-  , class Spec
-  , Aggregate
-  , Command
-  , Decision
+  ( Aggregate(..)
+  , Change
   , Envelope
-  , Event
   , Order
-  , Policy
+  , Policy(..)
   , Receipt
-  , Rejection
   , View
-  , aggregate
-  , command
+  , byId
   , commit
-  , emit
-  , event
-  , fromVariant
-  , order
-  , policy
-  , reject
-  , rejection
+  , keyed
   , replay
-  , toVariant
-  , view
   )
+import Domain.Internal.Labels (labelOf)

@@ -1,16 +1,16 @@
 -- | An HTTP boundary derived from the context. Routes, body codecs, and
--- | status codes all come from the context's labels and specs:
+-- | status codes all come from the context's labels and types:
 -- |
 -- | - `POST /<aggregate>/<id>/<command>` with an `Idempotency-Key` header
 -- |   sends the command. 200 returns the receipt, 409 the rejection, and
 -- |   422 says the key already names another command.
 -- | - `GET /<view>/<key>` reads the view's row.
 -- |
--- | The only hand-written input is `guards`. An aggregate label takes a
--- | record with one `principal -> id -> Boolean` per command label, so a new
--- | command needs its own decision about who may send it. A view label takes
--- | one `principal -> key -> Boolean`. A failure inside the runtime is a 500
--- | whose body says nothing about the failure.
+-- | The only hand-written input is `guards`. An aggregate label takes one
+-- | `principal -> id -> command -> Boolean`; match on the command without a
+-- | wildcard and a new command needs its own decision about who may send
+-- | it. A view label takes one `principal -> key -> Boolean`. A failure
+-- | inside the runtime is a 500 whose body says nothing about the failure.
 module Domain.Http (Method(..), Request, Response, serve) where
 
 import Prelude
@@ -20,20 +20,21 @@ import Data.Argonaut.Encode (class EncodeJson, encodeJson)
 import Data.Array (uncons)
 import Data.Array as Array
 import Data.Either (Either(..))
+import Data.Generic.Rep (class Generic)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), maybe)
 import Data.Newtype (class Newtype, wrap)
 import Data.String (Pattern(..), split)
 import Data.Symbol (class IsSymbol, reflectSymbol)
-import Domain.Internal.Codec (class DecodeCases, class EncodeCases, decodeLabelled, encodeLabelled)
 import Domain.Internal.Id (parseCommandId, versionNumber)
-import Domain.Internal.Kernel (class Spec, Aggregate, Command, Event, Policy, Rejection, View)
-import Domain.Internal.Labels (class Covers, class FieldOf)
+import Domain.Internal.Kernel (Aggregate, Policy, View)
+import Domain.Internal.Labels (class DecodeCases, class EncodeCases, decodeLabelled, encodeLabelled)
 import Domain.Runtime (AggregateHandle, Refusal(..), ViewHandle)
 import Effect.Aff (Aff, catchError)
 import Prim.Row as Row
 import Prim.RowList (class RowToList, Cons, Nil, RowList)
+import Prim.TypeError (class Fail, Beside, QuoteLabel, Text)
 import Record as Record
 import Record.Unsafe (unsafeGet)
 import Type.Proxy (Proxy(..))
@@ -51,8 +52,10 @@ type Route principal =
   { method :: Method, handle :: principal -> String -> Array String -> Request -> Aff Response }
 
 serve ::
-  forall ctx rl guards rt principal.
+  forall ctx rl guards grl rt principal.
   RowToList ctx rl =>
+  RowToList guards grl =>
+  KnownGuards grl rl =>
   Routes rl guards rt principal =>
   Record ctx ->
   Record guards ->
@@ -83,46 +86,43 @@ forbidden :: Response
 forbidden = failure 403 "the principal may not perform this operation"
 
 commandRoute ::
-  forall spec id s c e r b crl erl rrl principal.
-  Spec spec id s c e r b =>
+  forall id c crep e erep r rrep b principal.
   Newtype id String =>
-  RowToList c crl =>
-  RowToList e erl =>
-  RowToList r rrl =>
-  DecodeCases crl c =>
-  EncodeCases erl e =>
-  EncodeCases rrl r =>
+  Generic c crep =>
+  DecodeCases crep =>
+  Generic e erep =>
+  EncodeCases erep =>
+  Generic r rrep =>
+  EncodeCases rrep =>
   EncodeJson b =>
-  Map String (principal -> id -> Boolean) ->
-  AggregateHandle spec id b ->
+  (principal -> id -> c -> Boolean) ->
+  AggregateHandle id c e r b ->
   Route principal
-commandRoute guards handle =
+commandRoute guard handle =
   { method: POST
   , handle: \principal rawId rest request -> do
       let
         id = wrap rawId
       case rest of
-        [ name ] -> case Map.lookup name guards of
-          Nothing -> pure (failure 400 ("unknown command " <> name))
-          Just guard
-            | not (guard principal id) -> pure forbidden
+        [ name ] -> case decodeLabelled name request.body of
+          Left message -> pure (failure 400 message)
+          Right sent
+            | not (guard principal id sent) -> pure forbidden
             | otherwise -> case Map.lookup "idempotency-key" request.headers >>= parseCommandId of
               Nothing -> pure (failure 400 "missing or empty Idempotency-Key header")
-              Just commandId -> case decodeLabelled name request.body of
-                Left message -> pure (failure 400 message)
-                Right (sent :: Command spec) -> respond <$> handle.send commandId id sent
+              Just commandId -> respond <$> handle.send commandId id sent
         _ -> pure (failure 404 ("no route for " <> request.path))
   }
   where
   respond = case _ of
-    Left (Rejected (refused :: Rejection spec)) -> { status: 409, body: encodeLabelled refused }
+    Left (Rejected refused) -> { status: 409, body: encodeLabelled refused }
     Left (Reused reused) ->
       failure 422 ("the Idempotency-Key already names the command " <> reused.command)
     Right receipt ->
       { status: 200
       , body: encodeJson
           { version: versionNumber receipt.version
-          , events: map (encodeLabelled :: Event spec -> Json) receipt.events
+          , events: map encodeLabelled receipt.events
           , reply: encodeJson receipt.reply
           }
       }
@@ -148,9 +148,8 @@ viewRoute guard handle =
   where
   ok row = { status: 200, body: encodeJson row }
 
--- | One route per aggregate and view label. A missing guard, or an
--- | aggregate's guard record that misses or misspells a command, is a
--- | compile error naming the label.
+-- | One route per aggregate and view label. A missing guard is a compile
+-- | error naming the label.
 class Routes :: RowList Type -> Row Type -> Row Type -> Type -> Constraint
 class Routes rl guards rt principal where
   routes :: Proxy rl -> Record guards -> Record rt -> Map String (Route principal)
@@ -159,63 +158,65 @@ instance Routes Nil guards rt principal where
   routes _ _ _ = Map.empty
 
 instance ( IsSymbol l
-         , Spec spec id s c e r b
          , Newtype id String
-         , FieldOf "serve needs a guard for " l guards (Record commandGuards)
-         , RowToList commandGuards cgl
-         , RowToList c crl
-         , Covers "a guard names an undeclared command " cgl crl
-         , Covers "serve needs a guard for the command " crl cgl
-         , GuardTable cgl commandGuards principal id
-         , Row.Cons l (AggregateHandle spec id b) rtTail rt
-         , RowToList e erl
-         , RowToList r rrl
-         , DecodeCases crl c
-         , EncodeCases erl e
-         , EncodeCases rrl r
+         , RowToList guards grl
+         , HasGuard l grl (principal -> id -> c -> Boolean)
+         , Row.Cons l (AggregateHandle id c e r b) rtTail rt
+         , Generic c crep
+         , DecodeCases crep
+         , Generic e erep
+         , EncodeCases erep
+         , Generic r rrep
+         , EncodeCases rrep
          , EncodeJson b
          , Routes t guards rt principal
          ) =>
-  Routes (Cons l (Aggregate spec) t) guards rt principal where
+  Routes (Cons l (Aggregate id c e r s b) t) guards rt principal where
   routes _ guards rt = Map.insert (reflectSymbol (Proxy :: Proxy l))
-    ( commandRoute (guardTable (Proxy :: Proxy cgl) commandGuards)
-        (Record.get (Proxy :: Proxy l) rt)
-    )
+    (commandRoute (guardOf (Proxy :: Proxy l) guards) (Record.get (Proxy :: Proxy l) rt))
     (routes (Proxy :: Proxy t) guards rt)
-    where
-    commandGuards :: Record commandGuards
-    commandGuards = unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards
 else instance ( IsSymbol l
               , Newtype k String
               , EncodeJson v
-              , FieldOf "serve needs a guard for " l guards (principal -> k -> Boolean)
+              , RowToList guards grl
+              , HasGuard l grl (principal -> k -> Boolean)
               , Row.Cons l (ViewHandle k v) rtTail rt
               , Routes t guards rt principal
               ) =>
-  Routes (Cons l (View spec k v) t) guards rt principal where
+  Routes (Cons l (View i k v) t) guards rt principal where
   routes _ guards rt = Map.insert (reflectSymbol (Proxy :: Proxy l))
-    ( viewRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards)
-        (Record.get (Proxy :: Proxy l) rt)
-    )
+    (viewRoute (guardOf (Proxy :: Proxy l) guards) (Record.get (Proxy :: Proxy l) rt))
     (routes (Proxy :: Proxy t) guards rt)
 else instance Routes t guards rt principal =>
-  Routes (Cons l (Policy src tgt) t) guards rt principal where
+  Routes (Cons l (Policy i id c) t) guards rt principal where
   routes _ = routes (Proxy :: Proxy t)
 
--- | An aggregate's guards by command label. Each label comes from the
--- | record's own row list, so `Row.Cons` only fixes the guard's type.
-class GuardTable :: RowList Type -> Row Type -> Type -> Type -> Constraint
-class GuardTable rl guards principal id where
-  guardTable :: Proxy rl -> Record guards -> Map String (principal -> id -> Boolean)
+-- | Proves the guards name `l` with type `g`. A `Row.Cons` constraint would
+-- | report a missing guard as a unification of the whole guards row, so
+-- | the guard is read with `unsafeGet` under this proof instead.
+class HasGuard :: Symbol -> RowList Type -> Type -> Constraint
+class HasGuard l rl g | l rl -> g
 
-instance GuardTable Nil guards principal id where
-  guardTable _ _ = Map.empty
+instance HasGuard l (Cons l g t) g
+else instance HasGuard l t g => HasGuard l (Cons m x t) g
+else instance Fail (Beside (Text "serve needs a guard for ") (QuoteLabel l)) => HasGuard l Nil g
 
-instance ( IsSymbol l
-         , Row.Cons l (principal -> id -> Boolean) tail guards
-         , GuardTable t guards principal id
-         ) =>
-  GuardTable (Cons l g t) guards principal id where
-  guardTable _ guards =
-    Map.insert (reflectSymbol (Proxy :: Proxy l)) (Record.get (Proxy :: Proxy l) guards)
-      (guardTable (Proxy :: Proxy t) guards)
+guardOf :: forall l guards g. IsSymbol l => Proxy l -> Record guards -> g
+guardOf label = unsafeGet (reflectSymbol label)
+
+-- | Every guard names an aggregate or view of the context, so a misspelled
+-- | or stale guard is a compile error rather than a rule that never runs.
+class KnownGuards :: RowList Type -> RowList Type -> Constraint
+class KnownGuards grl rl
+
+instance KnownGuards Nil rl
+instance (Routable l rl, KnownGuards t rl) => KnownGuards (Cons l g t) rl
+
+class Routable :: Symbol -> RowList Type -> Constraint
+class Routable l rl
+
+instance Routable l (Cons l (Aggregate id c e r s b) t)
+else instance Routable l (Cons l (View i k v) t)
+else instance Routable l t => Routable l (Cons m x t)
+else instance Fail (Beside (Text "a guard names no aggregate or view of the context: ") (QuoteLabel l)) =>
+  Routable l Nil

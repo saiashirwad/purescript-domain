@@ -1,14 +1,23 @@
-module Bank.Customer (CustomerId(..), CustomerState(..), Customer, customer) where
+module Bank.Customer
+  ( CustomerId(..)
+  , CustomerState(..)
+  , CustomerCommand(..)
+  , CustomerEvent(..)
+  , CustomerRejection(..)
+  , CustomerChange
+  , Customer
+  , customer
+  ) where
 
 import Prelude
 
 import Data.Argonaut.Decode (class DecodeJson)
 import Data.Argonaut.Encode (class EncodeJson)
+import Data.Either (Either(..))
 import Data.Generic.Rep (class Generic)
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
-import Data.Variant (Variant)
-import Domain (Aggregate, Decision, aggregate, emit, reject)
+import Domain (Aggregate(..), Change)
 
 newtype CustomerId = CustomerId String
 
@@ -26,26 +35,37 @@ derive instance Generic CustomerState _
 instance Show CustomerState where
   show = genericShow
 
-type Customer =
-  { id :: CustomerId
-  , state :: CustomerState
-  , command :: Variant (registerCustomer :: { name :: String })
-  , event :: Variant (customerRegistered :: { name :: String })
-  , rejection :: Variant (alreadyRegistered :: {})
-  , reply :: Unit
-  }
+data CustomerCommand = RegisterCustomer { name :: String }
 
-customer :: Aggregate Customer
-customer = aggregate
+derive instance Eq CustomerCommand
+derive instance Generic CustomerCommand _
+instance Show CustomerCommand where
+  show = genericShow
+
+data CustomerEvent = CustomerRegistered { name :: String }
+
+derive instance Eq CustomerEvent
+derive instance Generic CustomerEvent _
+instance Show CustomerEvent where
+  show = genericShow
+
+data CustomerRejection = AlreadyRegistered
+
+derive instance Eq CustomerRejection
+derive instance Generic CustomerRejection _
+instance Show CustomerRejection where
+  show = genericShow
+
+type Customer = Aggregate CustomerId CustomerCommand CustomerEvent CustomerRejection CustomerState Unit
+
+type CustomerChange = Change CustomerId CustomerState CustomerEvent
+
+customer :: Customer
+customer = Aggregate
   { initial: Unregistered
-  , decide: { registerCustomer }
-  , evolve: { customerRegistered: \_ { name } -> Registered { name } }
+  , decide: case _, _ of
+      RegisterCustomer { name }, Unregistered -> Right [ CustomerRegistered { name } ]
+      RegisterCustomer _, Registered _ -> Left AlreadyRegistered
+  , evolve: \_ (CustomerRegistered { name }) -> Registered { name }
   , reply: \_ -> unit
   }
-
-registerCustomer ::
-  CustomerState ->
-  { name :: String } ->
-  Decision (alreadyRegistered :: {}) (customerRegistered :: { name :: String })
-registerCustomer Unregistered { name } = emit @"customerRegistered" { name }
-registerCustomer (Registered _) _ = reject @"alreadyRegistered" {}

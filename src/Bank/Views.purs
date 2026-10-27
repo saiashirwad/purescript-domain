@@ -2,49 +2,35 @@ module Bank.Views (Summary, StatementLine, Dashboard, summary, statement, dashbo
 
 import Prelude
 
-import Bank.Account (Account, AccountId, customerOf)
+import Bank.Account (AccountChange, AccountEvent(..), AccountId, customerOf)
 import Bank.Customer (CustomerId)
-import Data.Array (snoc)
 import Data.Maybe (Maybe(..))
-import Domain (View, view)
+import Domain (View, byId, keyed)
+import Domain.Fold as Fold
 
 type Summary = { owner :: Maybe CustomerId, balance :: Int }
 
-summary :: View Account AccountId Summary
-summary = view
-  { initial: { owner: Nothing, balance: 0 }
-  , on:
-      { accountOpened: \state { owner } -> state { owner = Just owner }
-      , moneyDeposited: \state { balanceAfter } -> state { balance = balanceAfter }
-      , moneyWithdrawn: \state { balanceAfter } -> state { balance = balanceAfter }
-      }
-  }
+summary :: View AccountChange AccountId Summary
+summary = byId $ Fold.fold { owner: Nothing, balance: 0 } \row { event } -> case event of
+  AccountOpened { owner } -> row { owner = Just owner }
+  MoneyDeposited { balanceAfter } -> row { balance = balanceAfter }
+  MoneyWithdrawn { balanceAfter } -> row { balance = balanceAfter }
 
 type StatementLine = { kind :: String, amount :: Int, balance :: Int }
 
--- | A view subscribes to the events it names and ignores the rest.
-statement :: View Account AccountId (Array StatementLine)
-statement = view
-  { initial: []
-  , on:
-      { moneyDeposited: \lines { amount, balanceAfter } ->
-          snoc lines { kind: "deposit", amount, balance: balanceAfter }
-      , moneyWithdrawn: \lines { amount, balanceAfter } ->
-          snoc lines { kind: "withdrawal", amount, balance: balanceAfter }
-      }
-  }
+statement :: View AccountChange AccountId (Array StatementLine)
+statement = byId $ Fold.foldMap \{ event } -> case event of
+  AccountOpened _ -> []
+  MoneyDeposited { amount, balanceAfter } -> [ { kind: "deposit", amount, balance: balanceAfter } ]
+  MoneyWithdrawn { amount, balanceAfter } -> [ { kind: "withdrawal", amount, balance: balanceAfter } ]
 
 type Dashboard = { accounts :: Int, balance :: Int }
 
 -- | One row per customer across all their accounts. Deposits do not name
--- | the customer; `key` asks the account, whose state knows its owner.
-dashboard :: View Account CustomerId Dashboard
-dashboard = view
-  { initial: { accounts: 0, balance: 0 }
-  , key: customerOf
-  , on:
-      { accountOpened: \row _ -> row { accounts = row.accounts + 1 }
-      , moneyDeposited: \row { amount } -> row { balance = row.balance + amount }
-      , moneyWithdrawn: \row { amount } -> row { balance = row.balance - amount }
-      }
-  }
+-- | the customer; the key asks the account, whose state knows its owner.
+dashboard :: View AccountChange CustomerId Dashboard
+dashboard = keyed (customerOf <<< _.state) $ Fold.fold { accounts: 0, balance: 0 } \row { event } ->
+  case event of
+    AccountOpened _ -> row { accounts = row.accounts + 1 }
+    MoneyDeposited { amount } -> row { balance = row.balance + amount }
+    MoneyWithdrawn { amount } -> row { balance = row.balance - amount }

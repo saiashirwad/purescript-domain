@@ -1,8 +1,8 @@
 #!/bin/bash
 # Applies one common mistake at a time and asserts the compiler's message.
 # An `expect` case names a file, the text to replace, the replacement, and
-# a fragment the compiler output must contain. An `expect_module` case is a
-# whole module and a fragment. Files are restored on exit, even on failure.
+# a fragment the compiler output must contain. Files are restored on exit,
+# even on failure.
 # Exit 0 only if every case matches.
 #
 # A case marked KNOWN pins an error that is not yet a one-line custom
@@ -18,7 +18,7 @@ restore() {
   for f in ${touched[@]+"${touched[@]}"}; do
     cp "$backup/$(echo "$f" | tr '/' '_')" "$f"
   done
-  rm -rf "$backup" "$forged"
+  rm -rf "$backup"
 }
 trap restore EXIT
 
@@ -65,135 +65,66 @@ expect() {
   check "$name" "$fragment"
 }
 
-# Builds `source` as a user module of its own, then deletes it.
-forged=test/Test/Forged.purs
-expect_module() {
-  local name="$1" source="$2" fragment="$3"
-  printf '%s\n' "$source" >"$forged"
-  output="$(iris build 2>&1)"
-  status=$?
-  rm -f "$forged"
-  check "$name" "$fragment"
-}
-
 if ! iris build >/dev/null 2>&1; then
   echo "FAIL baseline: the project does not build without any mistake"
   exit 1
 fi
 
-expect "missing decide handler" src/Bank/Account.purs \
-  "decide: { openAccount, depositMoney, withdrawMoney }" "decide: { openAccount, depositMoney }" \
-  "decide is missing a handler for the command withdrawMoney"
-expect "misspelled evolve handler" src/Bank/Account.purs \
-  "moneyWithdrawn: settle" "moneyWithdrawm: settle" \
-  "evolve handles an undeclared event moneyWithdrawm"
-expect "handler rejects with undeclared label" src/Bank/Account.purs \
-  "Decision (notOpen :: {}, nonPositiveAmount" "Decision (notOpen :: {}, frozen :: {}, nonPositiveAmount" \
-  "a decide handler rejects with an undeclared rejection frozen"
-expect "emit label not in narrow row" src/Bank/Account.purs \
-  'emit @"moneyDeposited" { amount, balanceAfter: balance + amount }' 'emit @"moneyWithdrawn" { amount, balanceAfter: balance + amount }' \
-  "the handler's event row does not include moneyWithdrawn"
-expect "view handles undeclared event" src/Bank/Views.purs \
-  "moneyWithdrawn: \\lines" "moneyWithdrew: \\lines" \
-  "a view handles an undeclared event moneyWithdrew"
-expect "keyed view handles undeclared event" src/Bank/Views.purs \
-  "moneyDeposited: \\row" "moneyDepositd: \\row" \
-  "a view handles an undeclared event moneyDepositd"
-expect "keyed view without a key" src/Bank/Views.purs \
-  "  , key: customerOf
+# A missing case is the compiler's own exhaustiveness error, which names
+# the missing constructor. Each handler is a `case`, so these cover every
+# place a new command or event needs a decision.
+expect "decide misses a case" src/Bank/Account.purs \
+  "  OpenAccount _, Open _ -> Left AlreadyOpen
 " "" \
-  "a view with rows keyed by CustomerId needs key :: AccountState -> Maybe CustomerId"
-expect "view key of the wrong type" src/Bank/Views.purs \
-  "dashboard :: View Account CustomerId Dashboard" "dashboard :: View Account AccountId Dashboard" \
-  "but its key is AccountState -> Maybe CustomerId"
-expect "misspelled view key field" src/Bank/Views.purs \
-  "key: customerOf" "kye: customerOf" \
-  "a view definition has the fields initial and on, and optionally key"
-expect "policy orders unknown command" src/Bank/Policy.purs \
-  'order @"openAccount"' 'order @"openAcount"' \
-  "the target aggregate declares no command openAcount"
-expect "spec missing a field" src/Bank/Customer.purs \
-  "  , reply :: Unit
-  }" "  }" \
-  "an aggregate spec needs the field reply"
+  "Pattern match is not exhaustive. Missing: OpenAccount ({ owner: _ }), Open _"
+expect "evolve misses an event" src/Bank/Account.purs \
+  "  MoneyWithdrawn movement -> settle movement
+" "" \
+  "Pattern match is not exhaustive. Missing: MoneyWithdrawn _"
+expect "view misses an event" src/Bank/Views.purs \
+  '  MoneyWithdrawn { amount, balanceAfter } -> [ { kind: "withdrawal", amount, balance: balanceAfter } ]
+' "" \
+  "Pattern match is not exhaustive. Missing: MoneyWithdrawn _"
+expect "guard misses a command" src/Bank/Api.purs \
+  "      WithdrawMoney _ -> ownsAccount principal id
+" "" \
+  "Pattern match is not exhaustive. Missing: WithdrawMoney _"
+expect "policy misses an event" src/Bank/Customer.purs \
+  "data CustomerEvent = CustomerRegistered { name :: String }" "data CustomerEvent = CustomerRegistered { name :: String } | CustomerRenamed { name :: String }" \
+  "Pattern match is not exhaustive. Missing: CustomerRenamed _"
 expect "context entry of wrong kind" src/Bank.purs \
   "bank = { account, customer, summary, statement, dashboard, provisioning }" "bank = { account, customer, summary, statement, dashboard, provisioning: 3 }" \
   "a context entry must be an Aggregate, a View, or a Policy, but provisioning is Int"
-expect "narrow payload differs from spec" src/Bank/Account.purs \
-  'Decision (alreadyOpen :: {}) (accountOpened :: { owner :: CustomerId })
-openAccount Unopened { owner } = emit @"accountOpened" { owner }
-openAccount (Open _) _ = reject @"alreadyOpen" {}' \
-  'Decision (alreadyOpen :: Unit) (accountOpened :: { owner :: CustomerId })
-openAccount Unopened { owner } = emit @"accountOpened" { owner }
-openAccount (Open _) _ = reject @"alreadyOpen" unit' \
-  "is Unit here but {} in the spec"
-expect "command with misspelled label" test/Test/Runtime.purs \
-  'command @"depositMoney" { amount: 100 })' 'command @"depositMony" { amount: 100 })' \
-  "the aggregate declares no command depositMony"
-expect "event sent as a command" test/Test/Runtime.purs \
-  '(command @"openAccount" { owner: CustomerId "sam" })' '(event @"accountOpened" { owner: CustomerId "sam" })' \
-  "Cannot unify 'Command' with 'Event'"
+expect "policy targets an aggregate missing from the context" src/Bank.purs \
+  "bank = { account, customer, summary, statement, dashboard, provisioning }" "bank = { customer, provisioning }" \
+  "a policy orders commands of an aggregate this context does not contain:"
+expect "view over an aggregate missing from the context" src/Bank.purs \
+  "bank = { account, customer, summary, statement, dashboard, provisioning }" "bank = { customer, summary }" \
+  "a view or policy reads events of an aggregate this context does not contain:"
 expect "missing guard" src/Bank/Api.purs \
   "  , statement: ownsAccount
 " "" \
   "serve needs a guard for statement"
-expect "missing command guard" src/Bank/Api.purs \
-  ", withdrawMoney: ownsAccount }" " }" \
-  "serve needs a guard for the command withdrawMoney"
-expect "misspelled command guard" src/Bank/Api.purs \
-  "depositMoney: ownsAccount" "depositMony: ownsAccount" \
-  "a guard names an undeclared command depositMony"
+expect "guard for an unknown label" src/Bank/Api.purs \
+  "  , statement: ownsAccount" "  , statment: ownsAccount
+  , statement: ownsAccount" \
+  "a guard names no aggregate or view of the context: statment"
+expect "guard for a policy" src/Bank/Api.purs \
+  "  , statement: ownsAccount" "  , provisioning: ownsAccount
+  , statement: ownsAccount" \
+  "a guard names no aggregate or view of the context: provisioning"
+expect "constructor with two arguments" src/Bank/Customer.purs \
+  "data CustomerRejection = AlreadyRegistered" "data CustomerRejection = AlreadyRegistered | Renamed String String" \
+  "a labelled constructor takes at most one argument; put its fields in a record"
 
-# The erased representations are sound only while user code cannot move a
-# value between specs, even through the internal modules. See "Soundness" in
-# docs/design.md.
-expect_module "forge an event through its constructor" 'module Test.Forged where
-import Bank.Account (Account)
-import Bank.Customer (Customer)
-import Domain.Internal.Kernel (Event(..), event)
-forged :: Event Account
-forged = case (event @"customerRegistered" { name: "ada" } :: Event Customer) of
-  Event v -> Event v' \
-  "'Event' is not in scope"
-expect_module "coerce an event across specs" 'module Test.Forged where
-import Bank.Account (Account)
-import Bank.Customer (Customer)
-import Domain (Event, event)
-import Safe.Coerce (coerce)
-forged :: Event Account
-forged = coerce (event @"customerRegistered" { name: "ada" } :: Event Customer)' \
-  "matching 'Customer' with 'Account'"
-expect_module "coerce an aggregate across specs" 'module Test.Forged where
-import Bank.Account (Account)
-import Bank.Customer (customer)
-import Domain (Aggregate)
-import Safe.Coerce (coerce)
-forged :: Aggregate Account
-forged = coerce customer' \
-  "matching 'Customer' with 'Account'"
-expect_module "event from another spec's row" 'module Test.Forged where
-import Bank.Account (Account)
-import Data.Variant (inj)
-import Domain (Event, fromVariant)
-import Type.Proxy (Proxy(..))
-forged :: Event Account
-forged = fromVariant (inj (Proxy :: Proxy "customerRegistered") { name: "ada" })' \
-  "Cannot unify '( customerRegistered :: { name :: String }"
-
-# KNOWN: not a custom error. The span is the enclosing signature, not the
-# call, and the message names types rather than the label.
-expect "command with wrong payload (KNOWN: plain unification error)" test/Test/Runtime.purs \
-  'command @"depositMoney" { amount: 100 })' 'command @"depositMoney" { amount: "100" })' \
-  "matching '{ amount :: String }' with '{ amount :: Int }'"
-
-# KNOWN: a custom error, but it prints the whole aggregate spec after the
-# header instead of naming the aggregate.
-expect "view over an aggregate missing from the context (KNOWN: spec dump)" src/Bank.purs \
-  "bank = { account, customer, summary, statement, dashboard, provisioning }" "bank = { customer, summary, statement, dashboard, provisioning }" \
-  "a view or policy reads an aggregate this context does not contain:"
-expect "view over a missing aggregate prints the spec (KNOWN: spec dump)" src/Bank.purs \
-  "bank = { account, customer, summary, statement, dashboard, provisioning }" "bank = { customer, summary, statement, dashboard, provisioning }" \
-  "state :: AccountState"
+# KNOWN: plain unification errors. The span is the enclosing signature,
+# not the call.
+expect "event sent as a command (KNOWN: plain unification error)" test/Test/Runtime.purs \
+  '(OpenAccount { owner: CustomerId "sam" })' '(AccountOpened { owner: CustomerId "sam" })' \
+  "Cannot unify 'AccountEvent' with 'AccountCommand'"
+expect "view keyed by the wrong type (KNOWN: plain unification error)" src/Bank/Views.purs \
+  "dashboard :: View AccountChange CustomerId Dashboard" "dashboard :: View AccountChange AccountId Dashboard" \
+  "Cannot unify 'CustomerId' with 'AccountId'"
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures case(s) failed"
