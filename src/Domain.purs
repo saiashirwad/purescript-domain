@@ -67,7 +67,7 @@ import Data.Either (Either(..))
 import Data.Foldable (foldl)
 import Data.Maybe (Maybe(..), maybe)
 import Data.Symbol (class IsSymbol, reflectSymbol)
-import Data.Variant (class VariantShows, Variant)
+import Data.Variant (class VariantShows, Unvariant(..), Variant, unvariant)
 import Data.Variant.Internal (class VariantTags, VariantRep(..))
 import Domain.Id
   ( CommandId
@@ -95,8 +95,7 @@ import Type.Proxy (Proxy(..))
 import Unsafe.Coerce (unsafeCoerce)
 
 -- | Projects an aggregate spec record into its parts by field name. A spec
--- | determines every part, which is what makes the erased representations
--- | below sound.
+-- | determines every part, which is what makes `Erased` sound.
 class Spec :: Type -> Type -> Type -> Row Type -> Row Type -> Row Type -> Type -> Constraint
 class Spec spec id s c e r b | spec -> id s c e r b
 
@@ -113,30 +112,57 @@ instance ( RowToList spec fields
          ) =>
   Spec (Record spec) id s c e r b
 
--- | Stands in for a type the spec determines.
+-- | A value whose type the spec determines but a type indexed by the spec
+-- | alone cannot name. Every `unsafeCoerce` in the library is in `erase`,
+-- | `unerase`, `inject`, and `widen`. Soundness in design/RATIONALE.md says
+-- | why each is safe.
 data Erased
 
+-- Sound because only this module erases, and each `unerase` reads the type
+-- that its partner `erase` wrote. The Soundness section lists the pairs.
+erase :: forall a. a -> Erased
+erase = unsafeCoerce
+
+unerase :: forall a. Erased -> a
+unerase = unsafeCoerce
+
+-- | `inj` for a label that `Field` has checked, so no `Prim.Row` constraint
+-- | sees an unchecked label. Sound because `Field` proves `l` carries `a` in
+-- | `row`.
+inject ::
+  forall @what @l a row rl. RowToList row rl => Field what l rl a => IsSymbol l => a -> Variant row
+inject value = unsafeCoerce (VariantRep { type: reflectSymbol (Proxy :: Proxy l), value })
+
+-- | Sound because `SubRow` proves each label of `small` is in `big` with the
+-- | same payload.
+widen ::
+  forall @what small srl big brl.
+  RowToList small srl => RowToList big brl => SubRow what srl brl => Variant small -> Variant big
+widen = unsafeCoerce
+
+-- | A variant's label, and its payload hidden until the handler for that
+-- | label reads it.
+untag :: forall row. Variant row -> { type :: String, value :: Erased }
+untag v = case unvariant v of
+  Unvariant split -> split \label value -> { type: reflectSymbol label, value: erase value }
+
+-- | A variant of the spec's command row.
 newtype Command :: Type -> Type
-newtype Command spec = Command (Variant ())
+newtype Command spec = Command Erased
 
 type role Command nominal
 
+-- | A variant of the spec's event row.
 newtype Event :: Type -> Type
-newtype Event spec = Event (Variant ())
+newtype Event spec = Event Erased
 
 type role Event nominal
 
+-- | A variant of the spec's rejection row.
 newtype Rejection :: Type -> Type
-newtype Rejection spec = Rejection (Variant ())
+newtype Rejection spec = Rejection Erased
 
 type role Rejection nominal
-
-tagged :: forall a. String -> a -> Variant ()
-tagged tag value = unsafeCoerce (VariantRep { type: tag, value })
-
-untagged :: forall r. Variant r -> { type :: String, value :: Erased }
-untagged v = case (unsafeCoerce v :: VariantRep Erased) of
-  VariantRep rep -> rep
 
 -- | `cmd @"depositMoney" { amount: 100 }`. The spec comes from the use
 -- | site, so no label needs a hand-written constructor.
@@ -148,7 +174,7 @@ cmd ::
   IsSymbol l =>
   a ->
   Command spec
-cmd = Command <<< tagged (reflectSymbol (Proxy :: Proxy l))
+cmd = fromVariant <<< inject @"the aggregate declares no command " @l
 
 event ::
   forall @l spec id s c e r b a erl.
@@ -158,7 +184,7 @@ event ::
   IsSymbol l =>
   a ->
   Event spec
-event = Event <<< tagged (reflectSymbol (Proxy :: Proxy l))
+event = fromVariant <<< inject @"the aggregate declares no event " @l
 
 rejection ::
   forall @l spec id s c e r b a rrl.
@@ -168,7 +194,7 @@ rejection ::
   IsSymbol l =>
   a ->
   Rejection spec
-rejection = Rejection <<< tagged (reflectSymbol (Proxy :: Proxy l))
+rejection = fromVariant <<< inject @"the aggregate declares no rejection " @l
 
 -- | Commands, events, and rejections are variants of their spec's rows.
 class Labelled :: Type -> Row Type -> Constraint
@@ -177,20 +203,20 @@ class Labelled a row | a -> row where
   fromVariant :: Variant row -> a
 
 instance Spec spec id s c e r b => Labelled (Command spec) c where
-  toVariant (Command v) = unsafeCoerce v
-  fromVariant v = Command (unsafeCoerce v)
+  toVariant (Command v) = unerase v
+  fromVariant = Command <<< erase
 
 instance Spec spec id s c e r b => Labelled (Event spec) e where
-  toVariant (Event v) = unsafeCoerce v
-  fromVariant v = Event (unsafeCoerce v)
+  toVariant (Event v) = unerase v
+  fromVariant = Event <<< erase
 
 instance Spec spec id s c e r b => Labelled (Rejection spec) r where
-  toVariant (Rejection v) = unsafeCoerce v
-  fromVariant v = Rejection (unsafeCoerce v)
+  toVariant (Rejection v) = unerase v
+  fromVariant = Rejection <<< erase
 
 -- | The label, for span attributes and wire tags, so nothing re-lists labels.
 tagOf :: forall a row. Labelled a row => a -> String
-tagOf = _.type <<< untagged <<< toVariant
+tagOf = _.type <<< untag <<< toVariant
 
 instance (Spec spec id s c e r b, Eq (Variant c)) => Eq (Command spec) where
   eq x y = toVariant x == toVariant y
@@ -226,7 +252,7 @@ emit ::
   IsSymbol l =>
   a ->
   Decision r e
-emit payload = Right [ unsafeCoerce (tagged (reflectSymbol (Proxy :: Proxy l)) payload) ]
+emit payload = Right [ inject @"the handler's event row does not include " @l payload ]
 
 reject ::
   forall @l a r rrl e.
@@ -235,7 +261,7 @@ reject ::
   IsSymbol l =>
   a ->
   Decision r e
-reject payload = Left (unsafeCoerce (tagged (reflectSymbol (Proxy :: Proxy l)) payload))
+reject payload = Left (inject @"the handler's rejection row does not include " @l payload)
 
 -- | A pure decider in spec terms. `evolve` is total: events are facts.
 type Decider spec s b =
@@ -246,7 +272,7 @@ type Decider spec s b =
   }
 
 newtype Aggregate :: Type -> Type
-newtype Aggregate spec = Aggregate (Decider spec Erased Erased)
+newtype Aggregate spec = Aggregate Erased
 
 type role Aggregate nominal
 
@@ -265,7 +291,7 @@ aggregate ::
   Table "evolve handles an undeclared event " ehl eh erl s s =>
   { initial :: s, decide :: Record dh, evolve :: Record eh, reply :: s -> b } ->
   Aggregate spec
-aggregate definition = Aggregate (unsafeCoerce typed)
+aggregate definition = Aggregate (erase typed)
   where
   decisions = decideTable (Proxy :: Proxy drl) definition.decide
   facts = table (Proxy :: Proxy "evolve handles an undeclared event ") (Proxy :: Proxy erl)
@@ -274,13 +300,13 @@ aggregate definition = Aggregate (unsafeCoerce typed)
   typed :: Decider spec s b
   typed =
     { initial: definition.initial
-    , decide: \state (Command v) -> dispatch decisions (\_ -> Right []) state v
-    , evolve: \state (Event v) -> dispatch facts identity state v
+    , decide: \state command -> dispatch decisions (\_ -> Right []) state (toVariant command)
+    , evolve: \state fact -> dispatch facts identity state (toVariant fact)
     , reply: definition.reply
     }
 
 decider :: forall spec id s c e r b. Spec spec id s c e r b => Aggregate spec -> Decider spec s b
-decider (Aggregate erased) = unsafeCoerce erased
+decider (Aggregate erased) = unerase erased
 
 -- | Decide, then fold the new events into the state.
 commit ::
@@ -309,8 +335,7 @@ replay aggregate' = foldl (decider aggregate').evolve
 -- | entity's state right after each event and names the row the event lands
 -- | in, or `Nothing` to skip it.
 newtype View :: Type -> Type -> Type -> Type
-newtype View spec k v =
-  View { initial :: v, step :: v -> Event spec -> v, key :: Erased -> Erased -> Maybe k }
+newtype View spec k v = View { initial :: v, step :: v -> Event spec -> v, key :: Erased }
 
 type role View nominal representational representational
 
@@ -326,8 +351,8 @@ view ::
   View spec k v
 view definition = View
   { initial: parts.initial
-  , step: \state (Event v) -> dispatch handlers identity state v
-  , key: unsafeCoerce parts.key
+  , step: \state fact -> dispatch handlers identity state (toVariant fact)
+  , key: erase parts.key
   }
   where
   parts :: { initial :: v, on :: Record hs, key :: id -> s -> Maybe k }
@@ -340,7 +365,7 @@ runView ::
   Spec spec id s c e r b =>
   View spec k v ->
   { initial :: v, step :: v -> Event spec -> v, key :: id -> s -> Maybe k }
-runView (View fold) = fold { key = unsafeCoerce fold.key }
+runView (View fold) = fold { key = unerase fold.key }
 
 -- | Reads a view definition: `{ initial, on }`, keyed by the source id, or
 -- | `{ initial, key, on }`.
@@ -408,7 +433,7 @@ else instance Fail
 
 -- | Reacts to events of `src` by ordering commands on `tgt`.
 newtype Policy :: Type -> Type -> Type
-newtype Policy src tgt = Policy (Object (Erased -> Erased -> Array (Order tgt)))
+newtype Policy src tgt = Policy Erased
 
 type role Policy nominal nominal
 
@@ -426,7 +451,7 @@ policy ::
   Table "a policy reacts to an undeclared event " hrl hs erl id (Array (Order tgt)) =>
   Record hs ->
   Policy src tgt
-policy handlers = Policy (unsafeCoerce typed)
+policy handlers = Policy (erase typed)
   where
   typed :: Object (id -> Erased -> Array (Order tgt))
   typed = table (Proxy :: Proxy "a policy reacts to an undeclared event ") (Proxy :: Proxy erl)
@@ -443,7 +468,9 @@ order ::
   a ->
   Order tgt
 order to payload = Order
-  { to: unsafeCoerce to, command: Command (tagged (reflectSymbol (Proxy :: Proxy l)) payload) }
+  { to: erase to
+  , command: fromVariant (inject @"the target aggregate declares no command " @l payload)
+  }
 
 -- | An order with its command id derived from the event that caused it.
 type Addressed id spec = { commandId :: CommandId, to :: id, command :: Command spec }
@@ -457,16 +484,15 @@ orders ::
   Policy src tgt ->
   Envelope sid (Event src) ->
   Array (Addressed tid tgt)
-orders name (Policy handlers) envelope = mapWithIndex address
-  ( dispatch handlers (\_ -> []) (unsafeCoerce envelope.id)
-      ( case envelope.event of
-          Event v -> v
-      )
-  )
+orders name (Policy handlers) envelope =
+  mapWithIndex address (dispatch typed (\_ -> []) envelope.id (toVariant envelope.event))
   where
+  typed :: Object (sid -> Erased -> Array (Order tgt))
+  typed = unerase handlers
+
   address index (Order placed) =
     { commandId: derivedCommandId name envelope.stream envelope.seq index
-    , to: unsafeCoerce placed.to
+    , to: unerase placed.to
     , command: placed.command
     }
 
@@ -484,10 +510,10 @@ type Envelope id ev =
 -- | same receipt.
 type Receipt ev b = { commandId :: CommandId, version :: Version, events :: Array ev, reply :: b }
 
-dispatch :: forall x out. Object (x -> Erased -> out) -> (x -> out) -> x -> Variant () -> out
+dispatch :: forall x row out. Object (x -> Erased -> out) -> (x -> out) -> x -> Variant row -> out
 dispatch handlers fallback x v =
   let
-    { type: tag, value } = untagged v
+    { type: tag, value } = untag v
   in
     maybe (fallback x) (\handler -> handler x value) (Object.lookup tag handlers)
 
@@ -518,8 +544,10 @@ instance ( IsSymbol l
   decideTable _ handlers =
     Object.insert (reflectSymbol (Proxy :: Proxy l)) run (decideTable (Proxy :: Proxy t) handlers)
     where
-    run state payload = bimap (Rejection <<< unsafeCoerce) (map (Event <<< unsafeCoerce))
-      (Record.get (Proxy :: Proxy l) handlers state (unsafeCoerce payload))
+    run state payload =
+      bimap (fromVariant <<< widen @"a decide handler rejects with an undeclared rejection ")
+        (map (fromVariant <<< widen @"a decide handler emits an undeclared event "))
+        (Record.get (Proxy :: Proxy l) handlers state (unerase payload))
 
 -- | Builds a dispatch table for handlers of shape `x -> payload -> out`,
 -- | where each payload type comes from `labels`.
@@ -537,5 +565,5 @@ instance ( IsSymbol l
          ) =>
   Table what (Cons l h t) hs labels x out where
   table what labels _ handlers = Object.insert (reflectSymbol (Proxy :: Proxy l))
-    (\x payload -> Record.get (Proxy :: Proxy l) handlers x (unsafeCoerce payload))
+    (\x payload -> Record.get (Proxy :: Proxy l) handlers x (unerase payload))
     (table what labels (Proxy :: Proxy t) handlers)

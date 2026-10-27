@@ -120,6 +120,42 @@ expect "missing guard" src/Bank/Api.purs \
 " "" \
   "Missing required properties: statement"
 
+# The erased representations are sound only while user code cannot move a
+# value between specs. See "Soundness" in design/RATIONALE.md.
+expect "forge an event through its constructor" test/Test/Stream.purs \
+  "import Test.Support (assertEqual, commandId, epoch, fail)
+" "import Test.Support (assertEqual, commandId, epoch, fail)
+import Bank.Customer (Customer)
+import Domain (Event(..), event)
+
+forged :: Event Account
+forged = case (event @\"customerRegistered\" { name: \"ada\" } :: Event Customer) of
+  Event v -> Event v
+" \
+  "'Event' is not in scope"
+expect "coerce an event across specs" test/Test/Stream.purs \
+  "import Test.Support (assertEqual, commandId, epoch, fail)
+" "import Test.Support (assertEqual, commandId, epoch, fail)
+import Bank.Customer (Customer)
+import Domain (Event, event)
+import Safe.Coerce (coerce)
+
+forged :: Event Account
+forged = coerce (event @\"customerRegistered\" { name: \"ada\" } :: Event Customer)
+" \
+  "matching 'Customer' with 'Account'"
+expect "event from another spec's row" test/Test/Stream.purs \
+  "import Test.Support (assertEqual, commandId, epoch, fail)
+" "import Test.Support (assertEqual, commandId, epoch, fail)
+import Data.Variant (inj)
+import Domain (Event, fromVariant)
+import Type.Proxy (Proxy(..))
+
+forged :: Event Account
+forged = fromVariant (inj (Proxy :: Proxy \"customerRegistered\") { name: \"ada\" })
+" \
+  "Cannot unify '( customerRegistered :: { name :: String }"
+
 # KNOWN: not a custom error. The span is the enclosing signature, not the
 # call, and the message names types rather than the label.
 expect "cmd with wrong payload (KNOWN: plain unification error)" test/Test/Runtime.purs \

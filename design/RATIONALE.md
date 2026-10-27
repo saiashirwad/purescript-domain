@@ -38,7 +38,7 @@ story account [ given @"accountOpened" { owner: CustomerId "sam" }, command @"de
 
 ## Shape
 
-**The spec record is the single source of truth.** `class Spec spec id s c e r b | spec -> id s c e r b` projects a plain record type by field name. Iris rejects `instance Spec { id :: id, ... }` with `[InstanceHeadLabeledRow] Only the ( | r ) form is allowed`. The instance therefore reads fields with `RowToList` lookups (`Field`) on `Record spec`. Each library type is indexed by the spec alone: `Aggregate`, `Command`, `Event`, `Rejection`, `Order`, `View spec k v`, `Policy src tgt`. Iris has no type families, so `Event Account` cannot be a synonym for `Variant (...)`. It is a nominal newtype over an erased variant. Coercions are sound because the fundep gives each spec exactly one row per role, and `type role ... nominal` blocks `coerce` across specs (per type-system-discipline). Role-typed values also make errors short. Passing an event as a command reports `Cannot unify 'Command' with 'Event'`, where raw variants would print two full rows.
+**The spec record is the single source of truth.** `class Spec spec id s c e r b | spec -> id s c e r b` projects a plain record type by field name. Iris rejects `instance Spec { id :: id, ... }` with `[InstanceHeadLabeledRow] Only the ( | r ) form is allowed`. The instance therefore reads fields with `RowToList` lookups (`Field`) on `Record spec`. Each library type is indexed by the spec alone: `Aggregate`, `Command`, `Event`, `Rejection`, `Order`, `View spec k v`, `Policy src tgt`. Iris has no type families, so `Event Account` cannot be a synonym for `Variant (...)`. It is a nominal newtype over an erased variant. Coercions are sound because the fundep gives each spec exactly one row per role, and `type role ... nominal` blocks `coerce` across specs (per type-system-discipline). The Soundness section below lists every coercion and what it relies on. Role-typed values also make errors short. Passing an event as a command reports `Cannot unify 'Command' with 'Event'`, where raw variants would print two full rows.
 
 **Handlers are records keyed by label, compiled to dispatch tables.** `aggregate`, `view`, and `policy` walk the handler record's `RowList` once. They check each label against the spec and build an `Object` keyed by label. Dispatch reads the variant's tag. A `decide` handler names its narrow rows in its signature. `SubRow` proves each narrow row is a sub-row of the spec's row, with the same payload types, so widening is a coercion and `expand` disappears. `decide` and `evolve` must cover their rows (`Covers`). Views and policies name any subset.
 
@@ -80,13 +80,49 @@ The state is the aggregate's own answer to "who owns this account". So the chose
 
 **What it deliberately does not do.** Sagas (`Process`) are gone. A view reads one aggregate's events. A row over two aggregates' events needs two views. There is no durable store and no envelope codec, because nothing persists envelopes yet. Policy rejections are traced on the target's span and do not fail the triggering command.
 
+## Soundness
+
+`Domain` has four `unsafeCoerce` calls, one in each of four unexported helpers. The rest of the library is type-checked.
+
+| Helper | What it does | Why it is sound |
+|---|---|---|
+| `erase`, `unerase` | Store a value as `Erased` and read it back. | Each `Erased` is read back at the type it was written with. The next table lists every pair. |
+| `inject` | Build a `Variant row` from a label and a payload. | `Field` proves that the label carries that payload type in `row`. |
+| `widen` | Turn a handler's narrow row into the spec's row. | `SubRow` proves that each narrow label is in the spec's row with the same payload. |
+
+`Erased` stands in for a type that the spec determines but that a newtype indexed by the spec alone cannot name, because Iris has no type families. Each pair below writes one field and reads it back.
+
+| Written by | Read by | Type at both ends |
+|---|---|---|
+| `fromVariant` | `toVariant` | `Variant c`, `Variant e`, or `Variant r`, inside `Command`, `Event`, or `Rejection` |
+| `aggregate` | `decider` | `Decider spec s b`, inside `Aggregate` |
+| `view` | `runView` | the key, `id -> s -> Maybe k`, inside `View` |
+| `policy` | `orders` | the handler table, `Object (id -> Erased -> Array (Order tgt))`, inside `Policy` |
+| `order` | `orders` | the target id, inside `Order` |
+| `untag` | the handler that `table` or `decideTable` stored under that label | the payload of the variant's own label |
+
+The invariant is that the spec fixes every type in the last column. Three facts enforce it, each in one place:
+
+1. `class Spec spec id s c e r b | spec -> id s c e r b` gives each spec exactly one id, state, reply, and row per role. Both ends of the first five pairs have a `Spec` constraint on the same spec, so they agree on the type. The last pair depends on labels instead, as the last item of the next list explains.
+2. `Domain` exports no constructor of `Command`, `Event`, `Rejection`, `Aggregate`, `View`, `Policy`, or `Order`, and does not export `Erased` or the helpers. Only `Domain` can write an `Erased`.
+3. Each of those newtypes declares its spec parameter `nominal` with `type role`, so `coerce` cannot move a value from one spec to another.
+
+These changes would break it:
+
+- Exporting a constructor. User code could unwrap an `Event Customer` and rewrap its contents as an `Event Account`.
+- Deleting a `type role` line. `Safe.Coerce.coerce` could do the same.
+- Weakening `Spec` so that a spec no longer fixes its parts. Two ends of a pair could then disagree on `s` or on a row. Deleting the fundep outright fails the library's own build.
+- Storing a `table` or `decideTable` handler under a key other than the label that its `Field` check used. A handler would then read a payload of the wrong type. Both builders key each handler by `reflectSymbol` of that label.
+
+`test/compile-errors.sh` asserts the first two from user code. With `Event(..)` exported, the case "forge an event through its constructor" compiles and fails. With `type role Event nominal` deleted, the case "coerce an event across specs" compiles and fails. A third case asserts that `fromVariant` rejects another spec's row. It guards the fundeps on `Spec` and `Labelled`. Deleting either one fails the library's own build first, so no one-line change makes that case fail alone.
+
 ## Synthesis decision
 
 Filled in by arena.
 
 ## Tradeoffs accepted
 
-- We accept 19 `unsafeCoerce` calls in `Domain`, each between a spec-indexed newtype and the row its spec determines, in exchange for one-parameter types and short errors. They are sound only because `Spec`'s fundep holds and no constructor is exported.
+- We accept four `unsafeCoerce` calls in `Domain`, inside `erase`, `unerase`, `inject`, and `widen`, in exchange for one-parameter types and short errors. They are sound only while the three facts under Soundness hold.
 - We accept that every `decide` handler needs a signature. Without one Iris reports `No instance found for: RowToList @Type ?131 ?134`, which is the one illegible error left. In exchange, each handler's narrow rows are the documentation and the guarantee.
 - We accept dispatch through a label-keyed `Object` with an unreachable fallback, in exchange for no `Row.Cons` on unchecked labels.
 - We accept that `start` reserves the label `stop` (`Row.Lacks "stop"`), in exchange for a flat `rt.account.send`.
@@ -147,7 +183,7 @@ Deleted: `Domain.Runtime.InMemory`, `.Actor`, `.Projection`, `.Trace`, `Domain.T
 | `Trace` | 48 | 0 |
 | `Bank` (context) | 0 | 13 |
 | **Bank total** | **1,552** | **302** |
-| Library | 1,852 | 1,822 |
-| Tests | 1,665 | 918 |
+| Library | 1,852 | 1,861 |
+| Tests | 1,665 | 1,053 |
 
 The bank now also holds the customer dashboard. Counts are after `iris format`.
