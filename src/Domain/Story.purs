@@ -1,108 +1,141 @@
+-- | Given/when/then stories against an aggregate's pure decider.
+-- |
+-- | ```purescript
+-- | story account
+-- |   [ given @"accountOpened" { owner: "sam" }
+-- |   , command @"depositMoney" { amount: 100 }
+-- |   , emits @"moneyDeposited" { amount: 100, balanceAfter: 100 }
+-- |   , replies { balance: 100 }
+-- |   ]
+-- | ```
 module Domain.Story
-  ( Step(..)
-  , StoryResult
-  , runStory
+  ( Step
+  , given
+  , command
+  , emits
+  , rejects
+  , replies
+  , story
   ) where
 
 import Prelude
 
-import Data.Array (snoc)
 import Data.Either (Either(..))
-import Data.Foldable (elem, foldl)
+import Data.Foldable (elem, foldM)
 import Data.Maybe (Maybe(..))
-import Domain (Decider, commit, zeroVersion)
-import Domain.Id.Internal (StreamId(..))
+import Data.Symbol (class IsSymbol)
+import Domain (class Spec, Aggregate, Command, Event, Rejection, cmd, commit, decider, event, rejection)
+import Domain.Labels (class Field)
+import Prim.RowList (class RowToList)
 
--- | A story is a list of steps in the business's own words:
--- | given this history, when this command, then these events.
-data Step e c r b
-  = Given e
-  | When c
-  | Then e
-  | Rejected r
-  | Replied b
+data Step spec b
+  = Given (Event spec)
+  | When (Command spec)
+  | Emits (Event spec)
+  | Rejects (Rejection spec)
+  | Replies b
 
-type StoryResult s e r b =
+given
+  :: forall @l spec id s c e r b a erl
+   . Spec spec id s c e r b
+  => RowToList e erl
+  => Field "the aggregate declares no event " l erl a
+  => IsSymbol l
+  => a
+  -> Step spec b
+given = Given <<< event @l
+
+command
+  :: forall @l spec id s c e r b a crl
+   . Spec spec id s c e r b
+  => RowToList c crl
+  => Field "the aggregate declares no command " l crl a
+  => IsSymbol l
+  => a
+  -> Step spec b
+command = When <<< cmd @l
+
+emits
+  :: forall @l spec id s c e r b a erl
+   . Spec spec id s c e r b
+  => RowToList e erl
+  => Field "the aggregate declares no event " l erl a
+  => IsSymbol l
+  => a
+  -> Step spec b
+emits = Emits <<< event @l
+
+rejects
+  :: forall @l spec id s c e r b a rrl
+   . Spec spec id s c e r b
+  => RowToList r rrl
+  => Field "the aggregate declares no rejection " l rrl a
+  => IsSymbol l
+  => a
+  -> Step spec b
+rejects = Rejects <<< rejection @l
+
+replies :: forall spec b. b -> Step spec b
+replies = Replies
+
+type Acc spec s b =
   { state :: s
-  , history :: Array e
-  , lastEvents :: Array e
+  , lastEvents :: Array (Event spec)
+  , lastRejection :: Maybe (Rejection spec)
   , lastReply :: Maybe b
-  , lastRejection :: Maybe r
   }
 
-type Acc s e r b =
-  { state :: s
-  , version :: Int
-  , history :: Array e
-  , lastEvents :: Array e
-  , lastReply :: Maybe b
-  , lastRejection :: Maybe r
-  }
-
-runStory
-  :: forall s c e r b
-   . Eq e
-  => Show e
-  => Eq r
-  => Show r
+-- | Runs the steps in order and returns the final state, or the first
+-- | expectation that failed.
+story
+  :: forall spec id s c e r b
+   . Spec spec id s c e r b
+  => Eq (Event spec)
+  => Show (Event spec)
+  => Eq (Rejection spec)
+  => Show (Rejection spec)
   => Eq b
   => Show b
-  => Decider s c e r b
-  -> Array (Step e c r b)
-  -> Either String (StoryResult s e r b)
-runStory decider steps =
-  map toResult (foldl step (Right initial) steps)
+  => Aggregate spec
+  -> Array (Step spec b)
+  -> Either String s
+story aggregate steps = map _.state (foldM step start steps)
   where
-  initial =
-    { state: decider.initial
-    , version: zeroVersion
-    , history: []
+  d = decider aggregate
+
+  start :: Acc spec s b
+  start =
+    { state: d.initial
     , lastEvents: []
-    , lastReply: Nothing
     , lastRejection: Nothing
+    , lastReply: Nothing
     }
 
-  step (Left error) _ = Left error
-  step (Right acc) current = case current of
-    Given event ->
+  step :: Acc spec s b -> Step spec b -> Either String (Acc spec s b)
+  step acc = case _ of
+    Given fact ->
       Right acc
-        { state = decider.evolve acc.state event
-        , history = snoc acc.history event
+        { state = d.evolve acc.state fact
         , lastEvents = []
-        , lastReply = Nothing
         , lastRejection = Nothing
+        , lastReply = Nothing
         }
-    When command ->
-      case commit decider { state: acc.state, version: acc.version, stream: StreamId "story" } command of
-        Left rejection ->
-          Right acc
-            { lastEvents = []
-            , lastReply = Nothing
-            , lastRejection = Just rejection
-            }
-        Right result ->
-          Right acc
-            { state = result.state
-            , version = result.version
-            , history = acc.history <> result.events
-            , lastEvents = result.events
-            , lastReply = Just result.reply
-            , lastRejection = Nothing
-            }
-    Then event ->
-      if elem event acc.lastEvents then Right acc
-      else Left ("expected event " <> show event <> ", got " <> show acc.lastEvents)
-    Rejected rejection ->
-      if acc.lastRejection == Just rejection then Right acc
-      else Left ("expected rejection " <> show rejection <> ", got " <> show acc.lastRejection)
-    Replied reply ->
-      if acc.lastReply == Just reply then Right acc
-      else Left ("expected reply " <> show reply <> ", got " <> show acc.lastReply)
-
-  toResult acc =
-    { state: acc.state
-    , history: acc.history
-    , lastEvents: acc.lastEvents
-    , lastReply: acc.lastReply
-    , lastRejection: acc.lastRejection
-    }
+    When sent -> Right case commit aggregate acc.state sent of
+      Left refused ->
+        acc { lastEvents = [], lastRejection = Just refused, lastReply = Nothing }
+      Right committed ->
+        acc
+          { state = committed.state
+          , lastEvents = committed.events
+          , lastRejection = Nothing
+          , lastReply = Just committed.reply
+          }
+    Emits expected
+      | elem expected acc.lastEvents -> Right acc
+      | otherwise -> Left ("expected event " <> show expected <> ", got " <> show acc.lastEvents)
+    Rejects expected
+      | acc.lastRejection == Just expected -> Right acc
+      | otherwise -> Left ("expected rejection " <> show expected <> ", got " <> show acc.lastRejection)
+    Replies expected
+      | acc.lastReply == Just expected -> Right acc
+      | otherwise -> Left ("expected reply " <> show expected <> ", got " <> show acc.lastReply)

@@ -7,7 +7,6 @@ package:
     - arrays
     - avar
     - catenable-lists
-    - console
     - datetime
     - effect
     - either
@@ -16,20 +15,16 @@ package:
     - foreign-object
     - integers
     - js-date
-    - lists
     - maybe
     - newtype
-    - node-http
     - ordered-collections
     - partial
     - prelude
-    - profunctor
     - record
     - refs
-    - routing-duplex
     - strings
     - tuples
-    - unfoldable
+    - unsafe-coerce
     - variant
   test:
     main: Test.Main
@@ -37,9 +32,7 @@ package:
       - console
       - effect
       - exceptions
-      - gen
       - prelude
-      - quickcheck
 workspace:
   packageSet:
     registry: 81.11.0

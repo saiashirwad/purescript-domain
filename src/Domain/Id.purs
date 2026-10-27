@@ -1,110 +1,98 @@
+-- | Identifiers the runtime owns. Constructors stay private: callers parse
+-- | a `CommandId` at the boundary, and the runtime is the only writer of
+-- | streams, versions, and sequences.
 module Domain.Id
-  ( IdError(..)
-  , CommandId
+  ( CommandId
   , StreamId
-  , TenantId
   , Version
   , Sequence
   , parseCommandId
-  , parseStreamId
-  , parseTenantId
-  , parseVersion
-  , parseSequence
   , commandIdText
   , streamIdText
-  , tenantIdText
+  , parseVersion
   , versionNumber
   , sequenceNumber
   , zeroVersion
-  , nextVersion
-  , nextVersionBy
-  , firstSequence
-  , nextSequence
+  , streamOf
+  , advance
+  , sequencesAfter
+  , derivedCommandId
   ) where
 
 import Prelude
 
-import Data.Either (Either(..))
+import Data.Array as Array
+import Data.Maybe (Maybe(..))
 import Data.String as String
-import Domain.Id.Internal as Internal
 
-type CommandId = Internal.CommandId
+newtype CommandId = CommandId String
 
-type StreamId = Internal.StreamId
+derive newtype instance Eq CommandId
+derive newtype instance Ord CommandId
+derive newtype instance Show CommandId
 
-type TenantId = Internal.TenantId
+-- | `<category>/<id>`, where the category is the aggregate's context label.
+newtype StreamId = StreamId String
 
-type Version = Internal.Version
+derive newtype instance Eq StreamId
+derive newtype instance Ord StreamId
+derive newtype instance Show StreamId
 
-type Sequence = Internal.Sequence
+-- | The number of events a stream holds.
+newtype Version = Version Int
 
-data IdError
-  = EmptyId
-  | NegativeVersion
-  | NegativeSequence
+derive newtype instance Eq Version
+derive newtype instance Ord Version
+derive newtype instance Show Version
 
-derive instance eqIdError :: Eq IdError
-derive instance ordIdError :: Ord IdError
+-- | An event's 1-based position in its stream.
+newtype Sequence = Sequence Int
 
-instance showIdError :: Show IdError where
-  show EmptyId = "EmptyId"
-  show NegativeVersion = "NegativeVersion"
-  show NegativeSequence = "NegativeSequence"
+derive newtype instance Eq Sequence
+derive newtype instance Ord Sequence
+derive newtype instance Show Sequence
 
-parseCommandId :: String -> Either IdError CommandId
-parseCommandId value
-  | isBlank value = Left EmptyId
-  | otherwise = Right (Internal.CommandId value)
-
-parseStreamId :: String -> Either IdError StreamId
-parseStreamId value
-  | isBlank value = Left EmptyId
-  | otherwise = Right (Internal.StreamId value)
-
-parseTenantId :: String -> Either IdError TenantId
-parseTenantId value
-  | isBlank value = Left EmptyId
-  | otherwise = Right (Internal.TenantId value)
-
-parseVersion :: Int -> Either IdError Version
-parseVersion value
-  | value < 0 = Left NegativeVersion
-  | otherwise = Right (Internal.Version value)
-
-parseSequence :: Int -> Either IdError Sequence
-parseSequence value
-  | value < 1 = Left NegativeSequence
-  | otherwise = Right (Internal.Sequence value)
+parseCommandId :: String -> Maybe CommandId
+parseCommandId raw
+  | String.null (String.trim raw) = Nothing
+  | otherwise = Just (CommandId raw)
 
 commandIdText :: CommandId -> String
-commandIdText (Internal.CommandId value) = value
+commandIdText (CommandId value) = value
 
 streamIdText :: StreamId -> String
-streamIdText (Internal.StreamId value) = value
+streamIdText (StreamId value) = value
 
-tenantIdText :: TenantId -> String
-tenantIdText (Internal.TenantId value) = value
+parseVersion :: Int -> Maybe Version
+parseVersion value
+  | value < 0 = Nothing
+  | otherwise = Just (Version value)
 
 versionNumber :: Version -> Int
-versionNumber (Internal.Version value) = value
+versionNumber (Version value) = value
 
 sequenceNumber :: Sequence -> Int
-sequenceNumber (Internal.Sequence value) = value
+sequenceNumber (Sequence value) = value
 
 zeroVersion :: Version
-zeroVersion = Internal.Version 0
+zeroVersion = Version 0
 
-nextVersion :: Version -> Version
-nextVersion (Internal.Version value) = Internal.Version (value + 1)
+streamOf :: String -> String -> StreamId
+streamOf category id = StreamId (category <> "/" <> id)
 
-nextVersionBy :: Version -> Int -> Version
-nextVersionBy (Internal.Version value) count = Internal.Version (value + count)
+advance :: Version -> Int -> Version
+advance (Version value) count = Version (value + count)
 
-firstSequence :: Sequence
-firstSequence = Internal.Sequence 1
+-- | The sequences of `count` events appended after `version`.
+sequencesAfter :: Version -> Int -> Array Sequence
+sequencesAfter (Version value) count
+  | count <= 0 = []
+  | otherwise = map Sequence (Array.range (value + 1) (value + count))
 
-nextSequence :: Sequence -> Sequence
-nextSequence (Internal.Sequence value) = Internal.Sequence (value + 1)
-
-isBlank :: String -> Boolean
-isBlank = String.null <<< String.trim
+-- | The id of the `index`th command a policy named `policy` orders in
+-- | reaction to the event at `seq` in `stream`. The same event always
+-- | yields the same id, so redelivery is harmless, and two policies
+-- | reacting to one event never collide.
+derivedCommandId :: String -> StreamId -> Sequence -> Int -> CommandId
+derivedCommandId policy (StreamId stream) (Sequence seq) index =
+  CommandId (policy <> ":" <> stream <> "@" <> show seq <> "#" <> show index)

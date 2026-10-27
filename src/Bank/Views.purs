@@ -7,52 +7,33 @@ module Bank.Views
 
 import Prelude
 
-import Bank.Account (AccountEvent, AccountId)
+import Bank.Account (Account)
+import Data.Array (snoc)
 import Data.Maybe (Maybe(..))
-import Data.Tuple (Tuple(..))
-import Data.Variant (match)
-import Domain (View)
+import Domain (View, view)
 
-type Summary =
-  { owner :: Maybe String
-  , balance :: Int
-  }
+type Summary = { owner :: Maybe String, balance :: Int }
 
-summary :: View AccountId Summary AccountId AccountEvent Unit
-summary =
+summary :: View Account Summary
+summary = view
   { initial: { owner: Nothing, balance: 0 }
-  , keyOf: \envelope -> Just envelope.id
-  , step: \state envelope ->
-      Tuple
-        ( match
-            { accountOpened: \event -> state { owner = Just event.owner }
-            , moneyDeposited: \event -> state { balance = event.balanceAfter }
-            , moneyWithdrawn: \event -> state { balance = event.balanceAfter }
-            }
-            envelope.event
-        )
-        []
+  , on:
+      { accountOpened: \state { owner } -> state { owner = Just owner }
+      , moneyDeposited: \state { balanceAfter } -> state { balance = balanceAfter }
+      , moneyWithdrawn: \state { balanceAfter } -> state { balance = balanceAfter }
+      }
   }
 
-type StatementLine =
-  { kind :: String
-  , amount :: Int
-  , balance :: Int
-  }
+type StatementLine = { kind :: String, amount :: Int, balance :: Int }
 
-statement :: View AccountId Unit AccountId AccountEvent StatementLine
-statement =
-  { initial: unit
-  , keyOf: \envelope -> Just envelope.id
-  , step: \_ envelope ->
-      Tuple unit
-        ( match
-            { accountOpened: \_ -> []
-            , moneyDeposited: \event ->
-                [ { kind: "deposit", amount: event.amount, balance: event.balanceAfter } ]
-            , moneyWithdrawn: \event ->
-                [ { kind: "withdrawal", amount: event.amount, balance: event.balanceAfter } ]
-            }
-            envelope.event
-        )
+-- | A view subscribes to the events it names and ignores the rest.
+statement :: View Account (Array StatementLine)
+statement = view
+  { initial: []
+  , on:
+      { moneyDeposited: \lines { amount, balanceAfter } ->
+          snoc lines { kind: "deposit", amount, balance: balanceAfter }
+      , moneyWithdrawn: \lines { amount, balanceAfter } ->
+          snoc lines { kind: "withdrawal", amount, balance: balanceAfter }
+      }
   }

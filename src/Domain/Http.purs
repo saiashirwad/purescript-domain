@@ -1,39 +1,53 @@
+-- | An HTTP boundary derived from the context. Routes, body codecs, and
+-- | status codes all come from the context's labels and specs:
+-- |
+-- | - `POST /<aggregate>/<id>/<command>` with an `Idempotency-Key` header
+-- |   sends the command. 200 returns the receipt, 409 the rejection.
+-- | - `GET /<view>/<id>[?atLeast=<version>]` reads the view.
+-- |
+-- | The only hand-written input is `guards`: one `principal -> id ->
+-- | Boolean` per aggregate and view label.
 module Domain.Http
   ( Method(..)
   , Request
   , Response
-  , ApiError(..)
-  , methodFromString
-  , methodToString
-  , header
-  , queryParam
-  , jsonResponse
-  , errorResponse
+  , serve
+  , class Routes
+  , routes
   ) where
 
 import Prelude
 
 import Data.Argonaut.Core (Json)
-import Data.Argonaut.Encode (encodeJson)
+import Data.Argonaut.Encode (class EncodeJson, encodeJson)
+import Data.Array (uncons)
 import Data.Either (Either(..))
+import Data.Int as Int
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe)
-import Data.String as String
+import Data.Maybe (Maybe(..), maybe)
+import Data.Newtype (class Newtype, wrap)
+import Data.String (Pattern(..), split)
+import Data.Array as Array
+import Data.Symbol (class IsSymbol, reflectSymbol)
+import Domain (class Spec, Aggregate, Command, Event, Policy, Rejection, View, parseCommandId, parseVersion, versionNumber)
+import Domain.Codec (class DecodeCases, class EncodeCases, decode, encode, labelled, tagged)
+import Domain.Labels (class Field)
+import Domain.Runtime (AggregateHandle, ViewHandle)
+import Effect.Aff (Aff)
+import Foreign.Object (Object)
+import Foreign.Object as Object
+import Prim.Row as Row
+import Prim.RowList (class RowToList, Cons, Nil, RowList)
+import Record as Record
+import Record.Unsafe (unsafeGet)
+import Type.Proxy (Proxy(..))
 
-data Method
-  = GET
-  | POST
+data Method = GET | POST
 
-derive instance eqMethod :: Eq Method
-derive instance ordMethod :: Ord Method
+derive instance Eq Method
 
-instance showMethod :: Show Method where
-  show GET = "GET"
-  show POST = "POST"
-
--- | A transport-neutral request. The Node adapter fills this record from an
--- | `IncomingMessage`; tests construct it directly. Header keys are lowercase.
+-- | Transport-neutral. A server adapter fills it; header keys are lowercase.
 type Request =
   { method :: Method
   , path :: String
@@ -42,75 +56,154 @@ type Request =
   , body :: Json
   }
 
-type Response =
-  { status :: Int
-  , body :: Json
+type Response = { status :: Int, body :: Json }
+
+type Route principal =
+  { method :: Method
+  , handle :: principal -> String -> Array String -> Request -> Aff Response
   }
 
-data ApiError
-  = BadRequest String
-  | Unauthorized String
-  | Forbidden String
-  | NotFound String
-  | MethodNotAllowed String
-  | Conflict String
-  | Unprocessable String
-  | Timeout String
-
-derive instance eqApiError :: Eq ApiError
-
-instance showApiError :: Show ApiError where
-  show = case _ of
-    BadRequest message -> "BadRequest " <> show message
-    Unauthorized message -> "Unauthorized " <> show message
-    Forbidden message -> "Forbidden " <> show message
-    NotFound message -> "NotFound " <> show message
-    MethodNotAllowed message -> "MethodNotAllowed " <> show message
-    Conflict message -> "Conflict " <> show message
-    Unprocessable message -> "Unprocessable " <> show message
-    Timeout message -> "Timeout " <> show message
-
-methodFromString :: String -> Either String Method
-methodFromString = case _ of
-  "GET" -> Right GET
-  "POST" -> Right POST
-  other -> Left ("unsupported HTTP method: " <> other)
-
-methodToString :: Method -> String
-methodToString = show
-
-header :: String -> Request -> Maybe String
-header name request =
-  Map.lookup (String.toLower name) request.headers
-
-queryParam :: String -> Request -> Maybe String
-queryParam name request =
-  Map.lookup name request.query
-
-jsonResponse :: Int -> Json -> Response
-jsonResponse status body = { status, body }
-
-errorResponse :: ApiError -> Response
-errorResponse apiError =
-  jsonResponse (statusOf apiError)
-    (encodeJson { error: messageOf apiError })
+serve
+  :: forall ctx rl guards rt principal
+   . RowToList ctx rl
+  => Routes rl guards rt principal
+  => Record ctx
+  -> Record guards
+  -> Record rt
+  -> principal
+  -> Request
+  -> Aff Response
+serve _ guards rt = \principal request ->
+  case Array.filter (_ /= "") (split (Pattern "/") request.path) # uncons of
+    Just { head: label, tail } | Just { head: id, tail: rest } <- uncons tail ->
+      case Object.lookup label table of
+        Nothing -> pure (failure 404 ("no route for " <> request.path))
+        Just route
+          | route.method /= request.method -> pure (failure 405 (label <> " does not accept this method"))
+          | otherwise -> route.handle principal id rest request
+    _ -> pure (failure 404 ("no route for " <> request.path))
   where
-  statusOf = case _ of
-    BadRequest _ -> 400
-    Unauthorized _ -> 401
-    Forbidden _ -> 403
-    NotFound _ -> 404
-    MethodNotAllowed _ -> 405
-    Conflict _ -> 409
-    Unprocessable _ -> 422
-    Timeout _ -> 408
+  table = routes (Proxy :: Proxy rl) guards rt
 
-  messageOf = case _ of
-    BadRequest message -> message
-    Unauthorized message -> message
-    Forbidden message -> message
-    NotFound message -> message
-    MethodNotAllowed message -> message
-    Conflict message -> message
-    Unprocessable message -> message
-    Timeout message -> message
+failure :: Int -> String -> Response
+failure status message = { status, body: encodeJson { error: message } }
+
+forbidden :: Response
+forbidden = failure 403 "the principal may not perform this operation"
+
+commandRoute
+  :: forall spec id s c e r b crl erl rrl principal
+   . Spec spec id s c e r b
+  => Newtype id String
+  => RowToList c crl
+  => RowToList e erl
+  => RowToList r rrl
+  => EncodeCases crl c
+  => DecodeCases crl c
+  => EncodeCases erl e
+  => DecodeCases erl e
+  => EncodeCases rrl r
+  => DecodeCases rrl r
+  => EncodeJson b
+  => (principal -> id -> Boolean)
+  -> AggregateHandle spec id b
+  -> Route principal
+commandRoute guard handle =
+  { method: POST
+  , handle: \principal rawId rest request -> do
+      let id = wrap rawId
+      case rest, Map.lookup "idempotency-key" request.headers >>= parseCommandId of
+        _, _ | not (guard principal id) -> pure forbidden
+        [ name ], Just commandId -> case decode labelled (tagged name request.body) of
+          Left message -> pure (failure 400 message)
+          Right (sent :: Command spec) -> do
+            result <- handle.send commandId id sent
+            pure case result of
+              Left (refused :: Rejection spec) -> { status: 409, body: encode labelled refused }
+              Right receipt ->
+                { status: 200
+                , body: encodeJson
+                    { version: versionNumber receipt.version
+                    , events: map (encode labelled :: Event spec -> Json) receipt.events
+                    , reply: encodeJson receipt.reply
+                    }
+                }
+        [ _ ], Nothing -> pure (failure 400 "missing or empty Idempotency-Key header")
+        _, _ -> pure (failure 404 ("no route for " <> request.path))
+  }
+
+viewRoute
+  :: forall id v principal
+   . Newtype id String
+  => EncodeJson v
+  => (principal -> id -> Boolean)
+  -> ViewHandle id v
+  -> Route principal
+viewRoute guard handle =
+  { method: GET
+  , handle: \principal rawId rest request -> do
+      let id = wrap rawId
+      if not (guard principal id) then pure forbidden
+      else if rest /= [] then pure (failure 404 ("no route for " <> request.path))
+      else case Map.lookup "atLeast" request.query of
+        Nothing -> found <$> handle.read id
+        Just raw -> case Int.fromString raw >>= parseVersion of
+          Nothing -> pure (failure 400 ("invalid atLeast version: " <> raw))
+          Just version -> maybe (failure 408 "the view did not catch up") ok <$> handle.readAt version id
+  }
+  where
+  found = maybe (failure 404 "nothing recorded for this id") ok
+  ok state = { status: 200, body: encodeJson state }
+
+-- | One route per aggregate and view label. A missing guard is a compile
+-- | error naming the label.
+class Routes :: RowList Type -> Row Type -> Row Type -> Type -> Constraint
+class Routes rl guards rt principal where
+  routes :: Proxy rl -> Record guards -> Record rt -> Object (Route principal)
+
+instance Routes Nil guards rt principal where
+  routes _ _ _ = Object.empty
+
+instance
+  ( IsSymbol l
+  , Spec spec id s c e r b
+  , Newtype id String
+  , RowToList guards grl
+  , Field "serve needs a guard for " l grl (principal -> id -> Boolean)
+  , Row.Cons l (AggregateHandle spec id b) rtTail rt
+  , RowToList c crl
+  , RowToList e erl
+  , RowToList r rrl
+  , EncodeCases crl c
+  , DecodeCases crl c
+  , EncodeCases erl e
+  , DecodeCases erl e
+  , EncodeCases rrl r
+  , DecodeCases rrl r
+  , EncodeJson b
+  , Routes t guards rt principal
+  ) =>
+  Routes (Cons l (Aggregate spec) t) guards rt principal where
+  routes _ guards rt =
+    Object.insert (reflectSymbol (Proxy :: Proxy l))
+      (commandRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards) (Record.get (Proxy :: Proxy l) rt))
+      (routes (Proxy :: Proxy t) guards rt)
+
+else instance
+  ( IsSymbol l
+  , Spec spec id s c e r b
+  , Newtype id String
+  , EncodeJson v
+  , RowToList guards grl
+  , Field "serve needs a guard for " l grl (principal -> id -> Boolean)
+  , Row.Cons l (ViewHandle id v) rtTail rt
+  , Routes t guards rt principal
+  ) =>
+  Routes (Cons l (View spec v) t) guards rt principal where
+  routes _ guards rt =
+    Object.insert (reflectSymbol (Proxy :: Proxy l))
+      (viewRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards) (Record.get (Proxy :: Proxy l) rt))
+      (routes (Proxy :: Proxy t) guards rt)
+
+else instance Routes t guards rt principal => Routes (Cons l (Policy src tgt) t) guards rt principal where
+  routes _ = routes (Proxy :: Proxy t)

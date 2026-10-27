@@ -1,87 +1,54 @@
 module Bank.Customer
   ( CustomerId(..)
   , CustomerState(..)
-  , CustomerEventRow
-  , CustomerEvent
-  , CustomerRejectionRow
-  , CustomerRejection
-  , CustomerCommandRow
-  , CustomerCommand
-  , customerStream
-  , unCustomerId
-  , customerDecider
-  , registerCustomer
-  , customerRegistered
-  , alreadyRegistered
+  , Customer
+  , customer
   ) where
 
 import Prelude
 
-import Data.Either (Either(..))
-import Data.Variant (Variant, inj, match)
-import Domain (Decider)
-import Domain.Id.Internal (StreamId(..))
-import Type.Proxy (Proxy(..))
+import Data.Generic.Rep (class Generic)
+import Data.Newtype (class Newtype)
+import Data.Show.Generic (genericShow)
+import Data.Variant (Variant)
+import Domain (Aggregate, Decision, aggregate, emit, reject)
 
 newtype CustomerId = CustomerId String
 
-derive newtype instance eqCustomerId :: Eq CustomerId
-derive newtype instance ordCustomerId :: Ord CustomerId
-derive newtype instance showCustomerId :: Show CustomerId
+derive instance Newtype CustomerId _
+derive newtype instance Eq CustomerId
+derive newtype instance Ord CustomerId
+derive newtype instance Show CustomerId
 
 data CustomerState
   = Unregistered
   | Registered { name :: String }
 
-instance eqCustomerState :: Eq CustomerState where
-  eq Unregistered Unregistered = true
-  eq (Registered a) (Registered b) = a.name == b.name
-  eq _ _ = false
+derive instance Eq CustomerState
+derive instance Generic CustomerState _
+instance Show CustomerState where
+  show = genericShow
 
-instance showCustomerState :: Show CustomerState where
-  show Unregistered = "Unregistered"
-  show (Registered a) = "Registered { name: " <> show a.name <> " }"
-
-type CustomerEventRow =
-  ( customerRegistered :: { name :: String } )
-
-type CustomerEvent = Variant CustomerEventRow
-
-type CustomerRejectionRow =
-  ( alreadyRegistered :: {} )
-
-type CustomerRejection = Variant CustomerRejectionRow
-
-type CustomerCommandRow =
-  ( registerCustomer :: { name :: String } )
-
-type CustomerCommand = Variant CustomerCommandRow
-
-customerStream :: CustomerId -> StreamId
-customerStream (CustomerId id) = StreamId ("Customer/" <> id)
-
-unCustomerId :: CustomerId -> String
-unCustomerId (CustomerId id) = id
-
-registerCustomer :: String -> CustomerCommand
-registerCustomer name = inj (Proxy :: Proxy "registerCustomer") { name }
-
-customerRegistered :: String -> CustomerEvent
-customerRegistered name = inj (Proxy :: Proxy "customerRegistered") { name }
-
-alreadyRegistered :: CustomerRejection
-alreadyRegistered = inj (Proxy :: Proxy "alreadyRegistered") {}
-
-customerDecider
-  :: Decider CustomerState CustomerCommand CustomerEvent CustomerRejection Unit
-customerDecider =
-  { initial: Unregistered
-  , decide: \state -> match
-      { registerCustomer: \input -> case state of
-          Unregistered -> Right [ customerRegistered input.name ]
-          Registered _ -> Left alreadyRegistered
-      }
-  , evolve: \_ -> match
-      { customerRegistered: \event -> Registered { name: event.name } }
-  , reply: \_ _ -> unit
+type Customer =
+  { id :: CustomerId
+  , state :: CustomerState
+  , command :: Variant (registerCustomer :: { name :: String })
+  , event :: Variant (customerRegistered :: { name :: String })
+  , rejection :: Variant (alreadyRegistered :: {})
+  , reply :: Unit
   }
+
+customer :: Aggregate Customer
+customer = aggregate
+  { initial: Unregistered
+  , decide: { registerCustomer }
+  , evolve: { customerRegistered: \_ { name } -> Registered { name } }
+  , reply: \_ -> unit
+  }
+
+registerCustomer
+  :: CustomerState
+  -> { name :: String }
+  -> Decision (alreadyRegistered :: {}) (customerRegistered :: { name :: String })
+registerCustomer Unregistered { name } = emit @"customerRegistered" { name }
+registerCustomer (Registered _) _ = reject @"alreadyRegistered" {}

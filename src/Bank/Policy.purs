@@ -1,25 +1,22 @@
 module Bank.Policy
-  ( mainAccountProvisioning
+  ( provisioning
+  , mainAccount
   ) where
 
 import Prelude
 
-import Bank.Account (AccountCommand, AccountId(..), openAccount)
-import Bank.Customer (CustomerEvent, CustomerId, unCustomerId)
-import Data.Variant (match)
-import Domain (Policy)
+import Bank.Account (Account, AccountId(..))
+import Bank.Customer (Customer, CustomerId(..))
+import Domain (Policy, order, policy)
 
--- | Whenever a customer registers, open their main account.
--- | The command is addressed by deriving the account id from the customer id,
--- | so replaying the policy produces the same command.
-mainAccountProvisioning :: Policy CustomerId CustomerEvent AccountId AccountCommand
-mainAccountProvisioning =
-  { on: \envelope -> match
-      { customerRegistered: \event ->
-          [ { target: AccountId (unCustomerId envelope.id <> "-main")
-            , command: openAccount event.name
-            }
-          ]
-      }
-      envelope.event
+-- | Whenever a customer registers, open their main account. The runtime
+-- | derives each order's command id from the triggering event, so a replay
+-- | or a retry addresses the same command.
+provisioning :: Policy Customer Account
+provisioning = policy
+  { customerRegistered: \customerId { name } ->
+      [ order @"openAccount" (mainAccount customerId) { owner: name } ]
   }
+
+mainAccount :: CustomerId -> AccountId
+mainAccount (CustomerId id) = AccountId (id <> "-main")
