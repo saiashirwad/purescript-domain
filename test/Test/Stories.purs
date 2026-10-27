@@ -25,6 +25,17 @@ testStories = do
     ]
   expectStory "refuses a deposit into an account that is not open"
     $ story account [ command @"depositMoney" { amount: 100 }, rejects @"notOpen" {} ]
+  expectStory "refuses a deposit of zero" $ story account
+    [ given @"accountOpened" { owner: CustomerId "sam" }
+    , command @"depositMoney" { amount: 0 }
+    , rejects @"nonPositiveAmount" { amount: 0 }
+    ]
+  expectStory "refuses a negative withdrawal" $ story account
+    [ given @"accountOpened" { owner: CustomerId "sam" }
+    , given @"moneyDeposited" { amount: 100, balanceAfter: 100 }
+    , command @"withdrawMoney" { amount: -50 }
+    , rejects @"nonPositiveAmount" { amount: -50 }
+    ]
   expectStory "refuses to open an account twice" $ story account
     [ given @"accountOpened" { owner: CustomerId "sam" }
     , command @"openAccount" { owner: CustomerId "kim" }

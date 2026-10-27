@@ -17,25 +17,21 @@ type Principal =
   , accounts :: Set AccountId
   }
 
-type Guard id = Principal -> id -> Boolean
-
-guards ::
-  { account :: Guard AccountId
-  , customer :: Guard CustomerId
-  , summary :: Guard AccountId
-  , statement :: Guard AccountId
-  , dashboard :: Guard CustomerId
-  }
+-- | No signature: `serve` checks each record against its aggregate's
+-- | commands, and a signature here would restate them.
 guards =
-  { account: ownsAccount
-  , customer: \principal _ -> isAdmin principal
+  { account: { openAccount: admin, depositMoney: ownsAccount, withdrawMoney: ownsAccount }
+  , customer: { registerCustomer: admin }
   , summary: ownsAccount
   , statement: ownsAccount
   , dashboard: \principal id -> principal.customer == Just id || isAdmin principal
   }
 
-ownsAccount :: Guard AccountId
+ownsAccount :: Principal -> AccountId -> Boolean
 ownsAccount principal id = Set.member id principal.accounts || isAdmin principal
+
+admin :: forall id. Principal -> id -> Boolean
+admin principal _ = isAdmin principal
 
 isAdmin :: Principal -> Boolean
 isAdmin principal = Set.member "admin" principal.roles

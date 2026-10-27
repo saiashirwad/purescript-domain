@@ -49,6 +49,8 @@ testCodec = do
             =<< jsonParser """{"version":2,"payload":{"type":"accountClosed","value":{}}}"""
         )
     )
+  assertThat "a payload version below every upcaster is refused"
+    (isLeft (decode accountEvents =<< jsonParser """{"version":-2147483648,"payload":{}}"""))
   assertThat "an unversioned payload is refused"
     ( isLeft
         (decode accountEvents =<< jsonParser """{"type":"accountOpened","value":{"owner":"sam"}}""")

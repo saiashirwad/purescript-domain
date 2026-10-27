@@ -50,8 +50,8 @@ A context is a record of aggregates, views, and policies, such as `bank = { acco
 ### Derived boundaries
 
 - `Domain.Story` runs given/when/then steps against the pure aggregate, with no runtime.
-- `Domain.Codec.labelled` encodes a command, event, or rejection as `{ "type": label, "value": payload }`. `versioned` wraps a codec with a version number and upcasters. `Bank.Codec.accountEvents` upcasts version 1 deposits.
-- `Domain.Http.serve` routes `POST /<aggregate>/<id>/<command>` with an `Idempotency-Key` header to `send`, and `GET /<view>/<key>` to `read`. The only hand-written input is one guard per aggregate and view label. A missing guard is a compile error.
+- `Domain.Codec.labelled` encodes a command, event, or rejection as `{ "type": label, "value": payload }`. Its halves, `encodeLabelled` and `decodeLabelled`, each need only their own direction's argonaut instances, so an event payload served over HTTP needs no `DecodeJson`. `decodeLabelled` takes the label and the payload apart, which is how a route receives them. `versioned` wraps a codec with a version number and upcasters, and applies them one version at a time, so a version older than every upcaster fails at its first lookup. `Bank.Codec.accountEvents` upcasts version 1 deposits.
+- `Domain.Http.serve` routes `POST /<aggregate>/<id>/<command>` with an `Idempotency-Key` header to `send`, and `GET /<view>/<key>` to `read`. The only hand-written input is the guards. An aggregate's guard is a record with one predicate per command label, checked against the spec in both directions, so a missing or misspelled command is a compile error that names it. A view's guard is one predicate. Every predicate takes the principal and the id or key, not the payload, so one predicate such as `ownsAccount` serves commands and views alike. A rule about the payload, such as a positive amount, belongs in `decide`. Any exception inside the runtime becomes a 500 with a fixed body, so an internal message never reaches the client.
 
 ## Runtime guarantees
 

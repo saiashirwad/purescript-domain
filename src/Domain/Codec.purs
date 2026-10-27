@@ -4,19 +4,18 @@
 -- | through upcasters.
 module Domain.Codec
   ( Codec
-  , codec
   , encode
   , decode
-  , json
   , labelled
-  , tagged
+  , encodeLabelled
+  , decodeLabelled
   , Upcaster
   , upcaster
   , versioned
   , class EncodeCases
   , encodeCases
   , class DecodeCases
-  , decodeCases
+  , decodeCase
   )
   where
 
@@ -25,10 +24,8 @@ import Prelude
 import Data.Argonaut.Core (Json, fromObject, fromString, stringify, toObject, toString)
 import Data.Argonaut.Decode (class DecodeJson, decodeJson, printJsonDecodeError)
 import Data.Argonaut.Encode (class EncodeJson, encodeJson)
-import Data.Array (range)
 import Data.Bifunctor (lmap)
 import Data.Either (Either(..), note)
-import Data.Foldable (foldM)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
@@ -43,28 +40,35 @@ import Type.Proxy (Proxy(..))
 
 newtype Codec a = Codec { encode :: a -> Json, decode :: Json -> Either String a }
 
-codec :: forall a. (a -> Json) -> (Json -> Either String a) -> Codec a
-codec encode' decode' = Codec { encode: encode', decode: decode' }
-
 encode :: forall a. Codec a -> a -> Json
 encode (Codec c) = c.encode
 
 decode :: forall a. Codec a -> Json -> Either String a
 decode (Codec c) = c.decode
 
-json :: forall a. EncodeJson a => DecodeJson a => Codec a
-json = Codec { encode: encodeJson, decode: lmap printJsonDecodeError <<< decodeJson }
-
 -- | The codec for `Command spec`, `Event spec`, or `Rejection spec`.
 labelled ::
   forall a row rl.
   Labelled a row => RowToList row rl => EncodeCases rl row => DecodeCases rl row => Codec a
-labelled = Codec
-  { encode: encodeCases (Proxy :: Proxy rl) <<< toVariant
-  , decode: map fromVariant <<< decodeCases (Proxy :: Proxy rl)
-  }
+labelled = Codec { encode: encodeLabelled, decode: read }
+  where
+  read value = do
+    object <- note ("expected a labelled object, got " <> stringify value) (toObject value)
+    label <- note "missing string field: type" (Object.lookup "type" object >>= toString)
+    decodeLabelled label =<< note "missing field: value" (Object.lookup "value" object)
 
--- | The wire shape of one labelled value.
+-- | The encoding half of `labelled`.
+encodeLabelled ::
+  forall a row rl. Labelled a row => RowToList row rl => EncodeCases rl row => a -> Json
+encodeLabelled = encodeCases (Proxy :: Proxy rl) <<< toVariant
+
+-- | The decoding half of `labelled`, for a label and a payload that arrive
+-- | apart, as the command name and body of an HTTP request do.
+decodeLabelled ::
+  forall a row rl.
+  Labelled a row => RowToList row rl => DecodeCases rl row => String -> Json -> Either String a
+decodeLabelled label = map fromVariant <<< decodeCase (Proxy :: Proxy rl) label
+
 tagged :: String -> Json -> Json
 tagged label payload =
   fromObject (Object.fromFoldable [ Tuple "type" (fromString label), Tuple "value" payload ])
@@ -85,22 +89,18 @@ instance (IsSymbol l, EncodeJson a, EncodeCases t tail, Row.Cons l a tail row) =
 -- | straight into it.
 class DecodeCases :: RowList Type -> Row Type -> Constraint
 class DecodeCases rl row where
-  decodeCases :: Proxy rl -> Json -> Either String (Variant row)
+  decodeCase :: Proxy rl -> String -> Json -> Either String (Variant row)
 
 instance DecodeCases Nil row where
-  decodeCases _ value = Left ("unknown label in " <> stringify value)
+  decodeCase _ label _ = Left ("unknown label " <> label)
 
 instance (IsSymbol l, DecodeJson a, DecodeCases t row, Row.Cons l a tail row) =>
   DecodeCases (Cons l a t) row where
-  decodeCases _ value = do
-    object <- note ("expected a labelled object, got " <> stringify value) (toObject value)
-    label <- note "missing string field: type" (Object.lookup "type" object >>= toString)
-    if label /= reflectSymbol (Proxy :: Proxy l)
-    then decodeCases (Proxy :: Proxy t) value
-    else do
-      payload <- note "missing field: value" (Object.lookup "value" object)
-      inj (Proxy :: Proxy l)
-        <$> lmap (\e -> label <> ": " <> printJsonDecodeError e) (decodeJson payload)
+  decodeCase _ label payload
+    | label == reflectSymbol (Proxy :: Proxy l) =
+        inj (Proxy :: Proxy l)
+          <$> lmap (\e -> label <> ": " <> printJsonDecodeError e) (decodeJson payload)
+    | otherwise = decodeCase (Proxy :: Proxy t) label payload
 
 -- | Rewrites a payload from version `from` to `from + 1`.
 newtype Upcaster = Upcaster { from :: Int, upcast :: Json -> Either String Json }
@@ -129,10 +129,12 @@ versioned current steps inner = Codec { encode: write, decode: read }
     payload <- note "missing field: payload" (Object.lookup "payload" object)
     when (version > current)
       (Left ("payload version " <> show version <> " is newer than " <> show current))
-    upgraded <-
-      if version < current then foldM step payload (range version (current - 1)) else pure payload
-    decode inner upgraded
+    decode inner =<< upgrade version payload
 
-  step payload version = case Map.lookup version upcasters of
-    Nothing -> Left ("no upcaster from payload version " <> show version)
-    Just upcast -> upcast payload
+  -- One step per upcaster, so a version below the oldest one fails on its
+  -- first lookup instead of counting up to `current`.
+  upgrade version payload
+    | version == current = pure payload
+    | otherwise = case Map.lookup version upcasters of
+        Nothing -> Left ("no upcaster from payload version " <> show version)
+        Just upcast -> upgrade (version + 1) =<< upcast payload

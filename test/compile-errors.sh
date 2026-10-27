@@ -70,7 +70,7 @@ expect "misspelled evolve handler" src/Bank/Account.purs \
   "moneyWithdrawn: settle" "moneyWithdrawm: settle" \
   "evolve handles an undeclared event moneyWithdrawm"
 expect "handler rejects with undeclared label" src/Bank/Account.purs \
-  "Decision (notOpen :: {}) (moneyDeposited :: Movement)" "Decision (notOpen :: {}, frozen :: {}) (moneyDeposited :: Movement)" \
+  "Decision (notOpen :: {}, nonPositiveAmount" "Decision (notOpen :: {}, frozen :: {}, nonPositiveAmount" \
   "a decide handler rejects with an undeclared rejection frozen"
 expect "emit label not in narrow row" src/Bank/Account.purs \
   'emit @"moneyDeposited" { amount, balanceAfter: balance + amount }' 'emit @"moneyWithdrawn" { amount, balanceAfter: balance + amount }' \
@@ -118,7 +118,13 @@ expect "event sent as a command" test/Test/Runtime.purs \
 expect "missing guard" src/Bank/Api.purs \
   "  , statement: ownsAccount
 " "" \
-  "Missing required properties: statement"
+  "serve needs a guard for statement"
+expect "missing command guard" src/Bank/Api.purs \
+  ", withdrawMoney: ownsAccount }" " }" \
+  "serve needs a guard for the command withdrawMoney"
+expect "misspelled command guard" src/Bank/Api.purs \
+  "depositMoney: ownsAccount" "depositMony: ownsAccount" \
+  "a guard names an undeclared command depositMony"
 
 # The erased representations are sound only while user code cannot move a
 # value between specs. See "Soundness" in docs/design.md.

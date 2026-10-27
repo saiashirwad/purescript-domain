@@ -76,7 +76,13 @@ type Account =
         , moneyDeposited :: Movement
         , moneyWithdrawn :: Movement
         )
-  , rejection :: Variant (alreadyOpen :: {}, notOpen :: {}, insufficientFunds :: Shortfall)
+  , rejection ::
+      Variant
+        ( alreadyOpen :: {}
+        , notOpen :: {}
+        , nonPositiveAmount :: { amount :: Int }
+        , insufficientFunds :: Shortfall
+        )
   , reply :: { balance :: Int }
   }
 ```
@@ -109,22 +115,28 @@ Each `decide` handler takes the state and the command's payload. Its `Decision` 
 
 ```purescript
 depositMoney ::
-  AccountState -> { amount :: Int } -> Decision (notOpen :: {}) (moneyDeposited :: Movement)
+  AccountState ->
+  { amount :: Int } ->
+  Decision (notOpen :: {}, nonPositiveAmount :: { amount :: Int }) (moneyDeposited :: Movement)
 depositMoney Unopened _ = reject @"notOpen" {}
-depositMoney (Open { balance }) { amount } =
-  emit @"moneyDeposited" { amount, balanceAfter: balance + amount }
+depositMoney (Open { balance }) { amount }
+  | amount <= 0 = reject @"nonPositiveAmount" { amount }
+  | otherwise = emit @"moneyDeposited" { amount, balanceAfter: balance + amount }
 
 withdrawMoney ::
   AccountState ->
   { amount :: Int } ->
-  Decision (notOpen :: {}, insufficientFunds :: Shortfall) (moneyWithdrawn :: Movement)
+  Decision
+    (notOpen :: {}, nonPositiveAmount :: { amount :: Int }, insufficientFunds :: Shortfall)
+    (moneyWithdrawn :: Movement)
 withdrawMoney Unopened _ = reject @"notOpen" {}
 withdrawMoney (Open { balance }) { amount }
+  | amount <= 0 = reject @"nonPositiveAmount" { amount }
   | amount > balance = reject @"insufficientFunds" { balance, requested: amount }
   | otherwise = emit @"moneyWithdrawn" { amount, balanceAfter: balance - amount }
 ```
 
-Give every `decide` handler a signature. The library checks the narrow rows in that signature against the spec, so a deposit handler cannot return `insufficientFunds`. `openAccount`, `settle`, and `balanceOf` are in `src/Bank/Account.purs`.
+Give every `decide` handler a signature. The library checks the narrow rows in that signature against the spec, so a deposit handler cannot return `insufficientFunds`. Both handlers reject an amount of zero or less with `nonPositiveAmount`. `openAccount`, `settle`, and `balanceOf` are in `src/Bank/Account.purs`.
 
 ### Test it with a story
 
@@ -302,26 +314,25 @@ In application code, pass `defaults`, and parse each command id with `parseComma
 
 ### Serve HTTP
 
-`serve` derives routes, body codecs, and status codes from the context. You write one guard per aggregate and view label. A missing guard is a compile error.
+`serve` derives routes, body codecs, and status codes from the context. You write the guards. An aggregate gets a record with one guard per command, so adding a command without deciding who may send it is a compile error. A view gets one guard. Each guard takes the principal and the id or key from the path, so one predicate serves commands and views alike.
 
 ```purescript
-type Guard id = Principal -> id -> Boolean
-
-guards ::
-  { account :: Guard AccountId
-  , customer :: Guard CustomerId
-  , summary :: Guard AccountId
-  , statement :: Guard AccountId
-  , dashboard :: Guard CustomerId
-  }
 guards =
-  { account: ownsAccount
-  , customer: \principal _ -> isAdmin principal
+  { account: { openAccount: admin, depositMoney: ownsAccount, withdrawMoney: ownsAccount }
+  , customer: { registerCustomer: admin }
   , summary: ownsAccount
   , statement: ownsAccount
   , dashboard: \principal id -> principal.customer == Just id || isAdmin principal
   }
+
+ownsAccount :: Principal -> AccountId -> Boolean
+ownsAccount principal id = Set.member id principal.accounts || isAdmin principal
+
+admin :: forall id. Principal -> id -> Boolean
+admin principal _ = isAdmin principal
 ```
+
+Only an admin opens an account, because `openAccount` names its owner. A customer who could open their own account could open it in someone else's name.
 
 `serve bank guards rt` takes a principal and a transport-neutral request. Your server adapter fills the request:
 
@@ -330,22 +341,17 @@ import Domain.Http (Method(..), serve)
 ```
 
 ```purescript
-    call who method path key query body = serve bank guards rt who
-      { method
-      , path
-      , query: Map.fromFoldable query
-      , headers: maybe' Map.empty (Map.singleton "idempotency-key") key
-      , body
-      }
+    call who method path key body = serve bank guards rt who
+      { method, path, headers: maybe' Map.empty (Map.singleton "idempotency-key") key, body }
 ```
 
-`POST /account/a-1/openAccount` with an `idempotency-key` header and the body `{"owner":"sam"}` returns status 200 and the receipt:
+An admin's `POST /account/a-1/openAccount` with an `idempotency-key` header and the body `{"owner":"sam"}` returns status 200 and the receipt:
 
 ```json
 {"events":[{"type":"accountOpened","value":{"owner":"sam"}}],"reply":{"balance":0},"version":1}
 ```
 
-A rejection returns 409 with `{"type":"insufficientFunds","value":{"balance":0,"requested":5}}`. An `idempotency-key` reused for a different command returns 422. `GET /summary/a-1` reads the view's row. `GET /dashboard/sam` reads the keyed row for customer `sam`.
+A rejection returns 409 with `{"type":"insufficientFunds","value":{"balance":0,"requested":5}}`. A guard that refuses returns 403. An `idempotency-key` reused for a different command returns 422. A failure inside the runtime, such as a request after `rt.stop`, returns 500 with `{"error":"internal error"}` and never the failure's own message. `GET /summary/a-1` reads the view's row. `GET /dashboard/sam` reads the keyed row for customer `sam`.
 
 ## Common mistakes and their errors
 
@@ -354,7 +360,7 @@ Each of these is a case in `test/compile-errors.sh`, which applies the mistake t
 A `decide` record without a handler for `withdrawMoney`:
 
 ```
-Error! · [CustomFailure] · src/Bank/Account.purs:53:11
+Error! · [CustomFailure] · src/Bank/Account.purs:59:11
   •
   │
   • decide is missing a handler for the command withdrawMoney
@@ -367,13 +373,13 @@ Error! · [CustomFailure] · src/Bank/Account.purs:53:11
 A deposit handler that emits `moneyWithdrawn`, which its `Decision` row does not include:
 
 ```
-Error! · [CustomFailure] · src/Bank/Account.purs:75:3
+Error! · [CustomFailure] · src/Bank/Account.purs:84:17
   •
   │
   • the handler's event row does not include moneyWithdrawn
   │
-  │     emit @"moneyWithdrawn" { amount, balanceAfter: balance + amount }
-  │     ╰────────────────────────────────────────────────────────────────
+  │     | otherwise = emit @"moneyWithdrawn" { amount, balanceAfter: balance + amount }
+  │                   ╰────────────────────────────────────────────────────────────────
   •
 ```
 

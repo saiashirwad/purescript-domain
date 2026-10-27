@@ -45,7 +45,13 @@ type Account =
         , moneyDeposited :: Movement
         , moneyWithdrawn :: Movement
         )
-  , rejection :: Variant (alreadyOpen :: {}, notOpen :: {}, insufficientFunds :: Shortfall)
+  , rejection ::
+      Variant
+        ( alreadyOpen :: {}
+        , notOpen :: {}
+        , nonPositiveAmount :: { amount :: Int }
+        , insufficientFunds :: Shortfall
+        )
   , reply :: { balance :: Int }
   }
 
@@ -69,17 +75,23 @@ openAccount Unopened { owner } = emit @"accountOpened" { owner }
 openAccount (Open _) _ = reject @"alreadyOpen" {}
 
 depositMoney ::
-  AccountState -> { amount :: Int } -> Decision (notOpen :: {}) (moneyDeposited :: Movement)
+  AccountState ->
+  { amount :: Int } ->
+  Decision (notOpen :: {}, nonPositiveAmount :: { amount :: Int }) (moneyDeposited :: Movement)
 depositMoney Unopened _ = reject @"notOpen" {}
-depositMoney (Open { balance }) { amount } =
-  emit @"moneyDeposited" { amount, balanceAfter: balance + amount }
+depositMoney (Open { balance }) { amount }
+  | amount <= 0 = reject @"nonPositiveAmount" { amount }
+  | otherwise = emit @"moneyDeposited" { amount, balanceAfter: balance + amount }
 
 withdrawMoney ::
   AccountState ->
   { amount :: Int } ->
-  Decision (notOpen :: {}, insufficientFunds :: Shortfall) (moneyWithdrawn :: Movement)
+  Decision
+    (notOpen :: {}, nonPositiveAmount :: { amount :: Int }, insufficientFunds :: Shortfall)
+    (moneyWithdrawn :: Movement)
 withdrawMoney Unopened _ = reject @"notOpen" {}
 withdrawMoney (Open { balance }) { amount }
+  | amount <= 0 = reject @"nonPositiveAmount" { amount }
   | amount > balance = reject @"insufficientFunds" { balance, requested: amount }
   | otherwise = emit @"moneyWithdrawn" { amount, balanceAfter: balance - amount }
 
