@@ -18,7 +18,7 @@ The fundep is what makes the erased representations sound. Each spec fixes exact
 
 ### Aggregate
 
-`aggregate { initial, decide, evolve, reply }` takes handler records keyed by label and walks each record's `RowList` once. It checks every label against the spec and builds an `Object` dispatch table keyed by label. At run time, dispatch reads the variant's tag and looks up the handler.
+`aggregate { initial, decide, evolve, reply }` takes handler records keyed by label and walks each record's `RowList` once. It checks every label against the spec and builds a dispatch table, a `Map` from label to handler. At run time, dispatch reads the variant's tag and looks up the handler.
 
 - `decide` must cover every command and `evolve` every event (`Covers`).
 - Each `decide` handler returns a `Decision r e`, whose rows are the rejections and events that handler may produce. `SubRow` proves each narrow row is a sub-row of the spec's row with the same payload types, so widening it is a coercion.
@@ -55,43 +55,57 @@ A context is a record of aggregates, views, and policies, such as `bank = { acco
 
 ## Runtime guarantees
 
-`Domain.Stream.turn` is the pure core. It takes a stream's state and one command, and returns `Committed`, `Duplicate`, or `Refused`. `Domain.Runtime` is a thin host around it. The host reads the clock, runs one turn per stream at a time, keeps the stream that a commit returns, applies views, emits a span, and dispatches policy orders.
+`Domain.Stream.turn` is the pure core. It takes a stream's state and one command, and returns `Committed`, `Duplicate`, `Conflict`, or `Refused`. `Domain.Runtime` is a thin host around it. The host reads the clock, runs one turn per stream at a time, keeps the stream that a commit returns, applies views, dispatches policy orders, and emits a span.
 
 ### Each command commits once per stream
 
-A stream keeps its receipts in its own state, keyed by command id. Sending a command id that the stream has already committed returns the stored receipt and appends nothing, even if the payload differs. The same id sent to another stream is a different command and commits there. A refusal stores nothing, so the same id is decided again later and may commit. `test/Test/Runtime.purs` covers all three cases, and `test/Test/Stream.purs` covers them against `turn` directly.
+A stream keeps its receipts in its own state, keyed by command id, and each receipt records the label of the command that made it. Sending a command id that the stream has already committed for the same label returns the stored receipt and appends nothing, even if the payload differs. Sending it with another label is an error the caller sees: `send` returns `Left (Reused { commandId, command })`, where `command` names the stored command, and HTTP answers 422. The same id sent to another stream is a different command and commits there. A refusal stores nothing, so the same id is decided again later and may commit. `test/Test/Runtime.purs` covers each case, and `test/Test/Stream.purs` covers them against `turn` directly.
+
+A `CommandId` is either a client's key, from `parseCommandId`, or an id the runtime derives for a policy's order. The two kinds never compare equal, whatever their text, so a client that sends the key `provisioning:customer/c-1@1#0` cannot claim that order's id and suppress it. `clientsCannotClaimOrderIds` in `test/Test/Tally.purs` covers this with a tally, whose bumps are not idempotent by themselves.
 
 ### Commands on one stream run in order
 
-A keyed serial executor, private to `Domain.Runtime`, runs one job at a time per stream key, in arrival order. Different streams run concurrently. `test/Test/Concurrency.purs` sends 40 deposits to one stream and checks that they commit in send order with no gaps in the sequence. A second test holds two streams inside `beforeCommand` at the same time, which would deadlock if the runtime serialized across streams.
+Each stream has a lock, an `AVar Unit` that a turn takes before it starts and puts back when it ends. An `AVar` serves waiting takes first come, first served, so commands on one stream are decided in the order they reach the lock. With a synchronous `now`, as in `defaults`, that is the order of the `send` calls. Different streams have different locks and run concurrently. The lock covers `beforeTurn` and the turn itself. It does not cover the policy dispatch, so an order can target any stream, the source stream included, without deadlock.
 
-### Mailboxes are bounded
+`test/Test/Concurrency.purs` sends 40 deposits to one held stream and checks that they commit in send order with no gaps in the sequence. A second test checks that a command sent to a held stream does not start its turn until the stream is free. A third holds two streams inside `beforeTurn` at the same time, which would deadlock if the runtime serialized across streams.
 
-Each stream's mailbox holds at most `capacity` jobs (64 in `defaults`, and at least 1). A producer that finds the mailbox full waits outside it, so a fast producer cannot grow memory. The bounded-mailbox test runs with capacity 1 and shows that a waiting producer's command never reaches the stream when the producer is killed.
+### An accepted command finishes without its caller
+
+`send` does not run a command on the caller's fiber. It admits the command and launches it on a fiber that the runtime owns, then joins that fiber. The launched fiber runs the whole unit: it takes the stream's lock, runs the turn, stores the stream and its views, dispatches the policies' orders, and emits the span. It lowers the in-flight count in its `finally`. Killing the caller cancels only the join, never the work. Nothing else holds a reference to the launched fiber, so nothing kills it. Its result travels as an `Either`, so a failure after its caller left is never an unhandled error.
+
+Every point at which a caller can be killed leads to the same outcome:
+
+- **Before `send` admits the command.** The stop check, the in-flight increment, and the launch run in one synchronous effect, and a kill can land only between effects. Either nothing was admitted, or the command was admitted and its fiber already owns the in-flight count.
+- **While the command waits for its stream's lock.** The take belongs to the launched fiber, which keeps waiting, so the command still commits in its place in line. `bracket` returns the lock however the turn ends.
+- **While the turn runs, or after the commit while orders are dispatched.** The launched fiber carries on through the policies and the span.
+
+`stop` sets the closed flag and reads the in-flight count in one synchronous effect. If the count is above zero, `stop` waits until the last launched fiber's `finally` brings it to zero. That `finally` runs after the policy dispatch and the span, so `stop` returns only once every admitted command, its orders, and the orders those orders place have committed or failed. A send after `stop` fails with `Domain.Runtime: the runtime is stopped`. Orders skip admission, because they run inside the fiber of the external command that caused them, which `stop` already waits for. A `stop` after `stop` has returned returns at once.
+
+`abandonedCommands` in `test/Test/Concurrency.purs` kills a caller at each of the three points above, then calls `stop`. It checks that `stop` is still waiting while the stream is held, and that the command and its order commit. With the work moved back onto the caller's fiber, all three cases fail.
 
 ### Views update in the same step as the commit
 
-The host stores the committed stream and applies every view in one synchronous `Effect`. A read right after `send` returns sees the write, and no receipt a caller can hold is ahead of the views. A retried command returns its stored receipt without reaching the views, so a view sees each committed event once.
+The host stores the committed stream and applies every view in one synchronous `Effect`. Each view first computes its next rows from its current rows and the commit's facts. The host stores the stream and the new rows only after every view has computed, so if a view throws, nothing is stored, and the caller sees the error. A read right after `send` returns sees the write, and no receipt a caller can hold is ahead of the views. A retried command returns its stored receipt without reaching the views, so a view sees each committed event once. `failingViewCommitsNothing` in `test/Test/Tally.purs` checks that a view that throws leaves the stream and the other views unchanged.
+
+Dispatch tables are `Map`s from label to handler, so a label such as `valueOf` or `constructor` dispatches like any other label, and a view that does not name it skips it. `prototypeLabels` in `test/Test/Tally.purs` covers this.
 
 A keyed row, such as a customer's dashboard, has one writer per source stream, and those streams run concurrently. They never interleave inside one update, because each update is one synchronous effect. The rows of a keyed view therefore update in commit order across streams, not in a per-row sequence. The dashboard sums deltas, so its result is the same in every order. An order-sensitive fold across accounts would see the interleaving.
 
 ### Policy orders have derived ids
 
-Policies run after the stream's turn, so an order can target any stream without deadlock. Each order's command id is `policy:stream@seq#index`, for example `provisioning:customer/c-1@1#0`. A retried command reruns the policies over its stored envelopes. The derived ids are the same, so the target returns its stored receipts. A failure between the commit and the dispatch, such as a failing `afterCommand` hook, heals on retry without sending anything twice. Including the policy label and the source stream keeps two policies that react to one event from colliding.
+Each order's command id is `policy:stream@seq#index`, for example `provisioning:customer/c-1@1#0`. Including the policy label and the source stream keeps two policies that react to one event from colliding. A retried command reruns the policies over its stored envelopes. The derived ids are the same, so the target returns its stored receipt for an order that already committed, and sends nothing twice. `derivedOrderIds` in `test/Test/Tally.purs` checks this with a tally, which would count a re-sent order twice.
+
+The same rerun heals a lost order. If the dispatch fails after the commit, for example because the target's `beforeTurn` fails, the caller sees the failure, and the order is missing. Retrying the triggering command with its id sends the order again. `retryHealsALostOrder` covers this.
 
 A rejected order does not fail the command that caused it. The rejection shows on the target command's span, and the triggering span counts the orders in `policy.orders`.
 
-### Stop drains
-
-`stop` refuses new external commands, waits for in-flight commands and their policy cascades, and then closes the executor after its queued jobs finish. A send after `stop` fails with `Domain.Runtime: the runtime is stopped`. Orders skip the gate because they run inside the external command that caused them, which `stop` already waits for. The two shutdown tests in `test/Test/Concurrency.purs` cover a queued command and a cascade into another aggregate.
-
 ### Failures stay with one command
 
-A failing `beforeCommand` hook aborts its command before the commit and reaches the caller. The stream keeps running, and the same command id can run again. A domain rejection is a value, not a failure.
+A failing `beforeTurn` aborts its command before the commit and reaches the caller. The stream keeps running, and the same command id can run again. A domain rejection is a value, not a failure.
 
 ### Each completed command emits one span
 
-The span is named `command.<label>`. Its attributes are `command.id`, `command.name`, `stream.id`, `outcome` (`committed`, `duplicate`, or `rejected`), `policy.orders`, and either `version` and `events` or `rejection`. The runtime takes every value from labels, so no user code lists them.
+The span is named `command.<label>`. Its attributes are `command.id`, `command.name`, `stream.id`, `outcome` (`committed`, `duplicate`, `conflict`, or `rejected`), and `policy.orders`. A committed or duplicate span adds `version` and `events`, and takes `command.name` from the stored receipt. A conflict span adds `stored.command`, the command that the id already names. A rejected span adds `rejection`. The runtime takes every value from labels, so no user code lists them.
 
 ## Soundness
 
@@ -110,7 +124,7 @@ The span is named `command.<label>`. Its attributes are `command.id`, `command.n
 | `fromVariant` | `toVariant` | `Variant c`, `Variant e`, or `Variant r`, inside `Command`, `Event`, or `Rejection` |
 | `aggregate` | `decider` | `Decider spec s b`, inside `Aggregate` |
 | `view` | `runView` | the key, `id -> s -> Maybe k`, inside `View` |
-| `policy` | `orders` | the handler table, `Object (id -> Erased -> Array (Order tgt))`, inside `Policy` |
+| `policy` | `orders` | the handler table, `Map String (id -> Erased -> Array (Order tgt))`, inside `Policy` |
 | `order` | `orders` | the target id, inside `Order` |
 | `untag` | the handler that `table` or `decideTable` stored under that label | the payload of the variant's own label |
 
@@ -157,7 +171,7 @@ A `decide` handler without a type signature also gives an illegible error, `No i
 
 - Four `unsafeCoerce` calls in `Domain` buy one-parameter types and short errors. They are sound only while the three facts under Soundness hold.
 - Every `decide` handler needs a signature, in exchange for narrow rows that document and guarantee what each handler produces.
-- Dispatch goes through a label-keyed `Object` with an unreachable fallback, so that no `Row.Cons` sees an unchecked label.
+- Dispatch goes through a label-keyed `Map` with an unreachable fallback, so that no `Row.Cons` sees an unchecked label.
 - `start` reserves the label `stop`, in exchange for a flat `rt.account.send`.
 - Every view has a third type parameter (`View Account AccountId Summary`), so that one view type covers keyed and unkeyed views and its signature says what `read` takes.
 - A keyed row's update order across streams is commit order, as described under the runtime guarantees.
@@ -176,7 +190,7 @@ A durable store would sit behind the host as a record of capabilities, with the 
 
 1. **Load.** Read a stream's envelopes in order and replay them through `evolve` to get the state and version.
 2. **Append with an expected version.** Write a commit's envelopes only if the stream is still at the version the turn started from. A mismatch means another writer got there first.
-3. **Rebuild receipts from history.** Every envelope carries its `commandId`. Grouping a stream's envelopes by command id gives each receipt's events and version, and replaying up to the last envelope of each group gives its reply. Refusals are never stored, so nothing else is needed.
+3. **Rebuild receipts from history.** Every envelope carries its `commandId`. Grouping a stream's envelopes by command id gives each receipt's events and version, and replaying up to the last envelope of each group gives its reply. A receipt also keeps the label of its command, which no envelope carries, so the store must write it with each commit. A stored command id must keep its kind, client or derived, because a client key can have the same text as a derived id. Refusals are never stored, so nothing else is needed.
 
 The event format would be the versioned `Codec (Event spec)` that `Bank.Codec.accountEvents` already round-trips. The envelope fields (`seq`, `commandId`, `at`) still need a codec.
 
@@ -197,7 +211,7 @@ The cost is the guarantee that a commit and its view updates happen in one synch
 | `Domain.Labels` | The label checks behind the custom compile errors. |
 | `Domain.Id` | Command ids, stream ids, versions, sequences, and derived order ids. |
 | `Domain.Stream` | One command's turn on one stream, as a pure function. |
-| `Domain.Runtime` | The host around `turn`, with the per-stream serial executor, views, policies, spans, and `stop`. |
+| `Domain.Runtime` | The host around `turn`, with per-stream locks, runtime-owned command fibers, views, policies, spans, and `stop`. |
 | `Domain.Story` | Given/when/then stories against the pure aggregate. |
 | `Domain.Codec` | Labelled and versioned JSON codecs. |
 | `Domain.Http` | Routes, status codes, and guards over a transport-neutral request. |

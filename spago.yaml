@@ -14,9 +14,9 @@ package:
     - foldable-traversable
     - foreign-object
     - integers
-    - js-date
     - maybe
     - newtype
+    - now
     - ordered-collections
     - partial
     - prelude

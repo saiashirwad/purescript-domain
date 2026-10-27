@@ -41,6 +41,7 @@ committed ::
 committed label = case _ of
   Committed result -> pure result
   Duplicate _ -> fail (label <> ": expected a commit, got a duplicate")
+  Conflict _ -> fail (label <> ": expected a commit, got a conflict")
   Refused refused -> fail (label <> ": expected a commit, got " <> show refused)
 
 openSam :: Command Account

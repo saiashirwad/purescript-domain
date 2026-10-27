@@ -13,6 +13,7 @@ import Test.Replay (testReplay)
 import Test.Runtime (testRuntime)
 import Test.Stories (testStories)
 import Test.Stream (testStream)
+import Test.Tally (testTally)
 import Test.Trace (testTrace)
 
 main :: Effect Unit
@@ -23,6 +24,7 @@ main = launchAff_ do
   testStream
   testRuntime
   testConcurrency
+  testTally
   testTrace
   testHttp
   liftEffect (log "All tests passed.")

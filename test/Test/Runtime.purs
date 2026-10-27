@@ -12,7 +12,7 @@ import Data.Foldable (for_)
 import Data.Maybe (Maybe(..))
 import Data.Traversable (for)
 import Domain (cmd, event, rejection, sequenceNumber, versionNumber)
-import Domain.Runtime (start)
+import Domain.Runtime (Refusal(..), start)
 import Effect.Aff (Aff, forkAff, joinFiber)
 import Test.Support (assertEqual, commandId, expectRight, isLeft, testOptions)
 
@@ -25,6 +25,7 @@ testRuntime = do
   dashboardUnderConcurrency
   policy
   commandIdsPerStream
+  reusedIds
 
 exactlyOnce :: Aff Unit
 exactlyOnce = do
@@ -63,10 +64,12 @@ rejectionStoresNothing = do
     =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
   refused <- rt.account.send (commandId "overdraw") sam (cmd @"withdrawMoney" { amount: 500 })
   assertEqual "an overdraft is refused"
-    (Left (rejection @"insufficientFunds" { balance: 0, requested: 500 })) (map _.events refused)
+    (Left (Rejected (rejection @"insufficientFunds" { balance: 0, requested: 500 })))
+    (map _.events refused)
   again <- rt.account.send (commandId "overdraw") sam (cmd @"withdrawMoney" { amount: 500 })
   assertEqual "a refused command id is decided again, not replayed"
-    (Left (rejection @"insufficientFunds" { balance: 0, requested: 500 })) (map _.events again)
+    (Left (Rejected (rejection @"insufficientFunds" { balance: 0, requested: 500 })))
+    (map _.events again)
   _ <- expectRight "fund"
     =<< rt.account.send (commandId "fund") sam (cmd @"depositMoney" { amount: 1000 })
   retried <- expectRight "retry after funding"
@@ -223,7 +226,7 @@ policy = do
   again <-
     rt.customer.send (commandId "register-again") ada (cmd @"registerCustomer" { name: "ada" })
   assertEqual "a new command id for a registered customer is refused"
-    (Left (rejection @"alreadyRegistered" {})) (map _.events again)
+    (Left (Rejected (rejection @"alreadyRegistered" {}))) (map _.events again)
   stillOne <- rt.account.history (mainAccount ada)
   assertEqual "a refused trigger opens nothing" 1 (length stillOne)
   rt.stop
@@ -244,4 +247,20 @@ commandIdsPerStream = do
   summary <- rt.summary.read savings
   assertEqual "the second account is open" (Just { owner: Just (CustomerId "sam"), balance: 0 })
     summary
+  rt.stop
+
+-- | A command id names one command. Reusing it for another command is an
+-- | error the caller sees, not the first command's receipt.
+reusedIds :: Aff Unit
+reusedIds = do
+  rt <- start bank testOptions
+  let
+    sam = AccountId "a-1"
+  _ <- expectRight "open"
+    =<< rt.account.send (commandId "k") sam (cmd @"openAccount" { owner: CustomerId "sam" })
+  reused <- rt.account.send (commandId "k") sam (cmd @"depositMoney" { amount: 5 })
+  assertEqual "the caller learns which command the id already names"
+    (Left (Reused { commandId: commandId "k", command: "openAccount" })) (map _.events reused)
+  history <- rt.account.history sam
+  assertEqual "a reused id appends nothing" 1 (length history)
   rt.stop

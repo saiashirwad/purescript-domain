@@ -252,7 +252,7 @@ Each label becomes a runtime handle (`rt.account`), a stream category (`account/
 
 ```purescript
 import Domain (cmd, event, rejection, sequenceNumber, versionNumber)
-import Domain.Runtime (start)
+import Domain.Runtime (Refusal(..), start)
 ```
 
 ```purescript
@@ -269,7 +269,7 @@ import Domain.Runtime (start)
     (Just { owner: Just (CustomerId "sam"), balance: 0 }) afterOpen
 ```
 
-`send` takes a command id, the aggregate id, and a command built with `cmd`. It returns `Left` with the rejection, or `Right` with a receipt that holds `commandId`, `version`, `events`, and `reply`. Views update in the same step as the commit, so the read right after `send` sees the new row.
+`send` takes a command id, the aggregate id, and a command built with `cmd`. It returns `Right` with a receipt that holds `commandId`, `version`, `events`, and `reply`, or `Left` with a `Refusal`. A refusal is `Rejected` with the aggregate's rejection, or `Reused` when the command id already names a different command on that stream. Views update in the same step as the commit, so the read right after `send` sees the new row.
 
 A command id names one command to one stream. Sending the same id again returns the stored receipt and appends nothing:
 
@@ -298,7 +298,7 @@ commandId :: String -> CommandId
 commandId raw = unsafePartial (fromJust (parseCommandId raw))
 ```
 
-In application code, pass `defaults`, and parse each command id with `parseCommandId`, which returns `Nothing` for a blank string. Call `rt.stop` to shut down. It refuses new commands, lets in-flight commands and their policy orders finish, and then returns.
+In application code, pass `defaults`, and parse each command id with `parseCommandId`, which returns `Nothing` for a blank string. Call `rt.stop` to shut down. It refuses new commands, lets in-flight commands and their policy orders finish, and then returns. A command keeps running when its caller gives up, so a request timeout never strands a commit without its policy orders.
 
 ### Serve HTTP
 
@@ -345,7 +345,7 @@ import Domain.Http (Method(..), serve)
 {"events":[{"type":"accountOpened","value":{"owner":"sam"}}],"reply":{"balance":0},"version":1}
 ```
 
-A rejection returns 409 with `{"type":"insufficientFunds","value":{"balance":0,"requested":5}}`. `GET /summary/a-1` reads the view's row. `GET /dashboard/sam` reads the keyed row for customer `sam`.
+A rejection returns 409 with `{"type":"insufficientFunds","value":{"balance":0,"requested":5}}`. An `idempotency-key` reused for a different command returns 422. `GET /summary/a-1` reads the view's row. `GET /dashboard/sam` reads the keyed row for customer `sam`.
 
 ## Common mistakes and their errors
 

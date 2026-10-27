@@ -18,9 +18,9 @@
             "foldable-traversable",
             "foreign-object",
             "integers",
-            "js-date",
             "maybe",
             "newtype",
+            "now",
             "ordered-collections",
             "partial",
             "prelude",
@@ -996,22 +996,6 @@
         "tuples"
       ]
     },
-    "foreign": {
-      "type": "registry",
-      "version": "7.0.1",
-      "integrity": "sha256-g9B+pe+2gOcf3PVrSkgG5y9tZ1WtTygbtwprlT6fBbg=",
-      "dependencies": [
-        "either",
-        "functions",
-        "integers",
-        "lists",
-        "maybe",
-        "prelude",
-        "strings",
-        "transformers",
-        "unsafe-coerce"
-      ]
-    },
     "foreign-object": {
       "type": "registry",
       "version": "4.1.1",
@@ -1107,21 +1091,6 @@
         "prelude"
       ]
     },
-    "js-date": {
-      "type": "registry",
-      "version": "8.0.0",
-      "integrity": "sha256-DNQrp4xYc8o80jtxo0aOkUeXGi6h0Xidkk2ZQ8Y4l5Y=",
-      "dependencies": [
-        "datetime",
-        "effect",
-        "enums",
-        "foreign",
-        "functions",
-        "integers",
-        "maybe",
-        "prelude"
-      ]
-    },
     "lazy": {
       "type": "registry",
       "version": "6.0.1",
@@ -1197,6 +1166,16 @@
         "prelude",
         "tuples",
         "unfoldable"
+      ]
+    },
+    "now": {
+      "type": "registry",
+      "version": "6.0.0",
+      "integrity": "sha256-mTyG4s8tps3XIf0jjV/lME2/QlwMzrQly2wqfSSUM3o=",
+      "dependencies": [
+        "datetime",
+        "effect",
+        "prelude"
       ]
     },
     "numbers": {

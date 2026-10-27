@@ -1,6 +1,7 @@
 -- | Command ids, stream ids, versions, and sequences. Constructors stay
--- | private, so a `CommandId` comes only from `parseCommandId`, which refuses
--- | a blank string. `Domain` re-exports what callers need. The stream,
+-- | private, so a client's `CommandId` comes only from `parseCommandId`,
+-- | which refuses a blank string, and an order's only from
+-- | `derivedCommandId`. `Domain` re-exports what callers need. The stream,
 -- | version, and order-id builders are for the runtime.
 module Domain.Id
   ( CommandId
@@ -27,11 +28,17 @@ import Data.Array as Array
 import Data.Maybe (Maybe(..))
 import Data.String as String
 
-newtype CommandId = CommandId String
+-- | A client's key, or the id the runtime derives for a policy's order.
+-- | The two never compare equal, whatever their text, so a client cannot
+-- | claim an order's id in advance.
+data CommandId = Client String | Derived String
 
-derive newtype instance Eq CommandId
-derive newtype instance Ord CommandId
-derive newtype instance Show CommandId
+derive instance Eq CommandId
+derive instance Ord CommandId
+
+instance Show CommandId where
+  show (Client key) = show key
+  show (Derived id) = "(derived " <> show id <> ")"
 
 -- | `<category>/<id>`, where the category is the aggregate's context label.
 newtype StreamId = StreamId String
@@ -57,10 +64,12 @@ derive newtype instance Show Sequence
 parseCommandId :: String -> Maybe CommandId
 parseCommandId raw
   | String.null (String.trim raw) = Nothing
-  | otherwise = Just (CommandId raw)
+  | otherwise = Just (Client raw)
 
 commandIdText :: CommandId -> String
-commandIdText (CommandId value) = value
+commandIdText = case _ of
+  Client key -> key
+  Derived id -> id
 
 streamIdText :: StreamId -> String
 streamIdText (StreamId value) = value
@@ -97,4 +106,4 @@ sequencesAfter (Version value) count
 -- | reacting to one event never collide.
 derivedCommandId :: String -> StreamId -> Sequence -> Int -> CommandId
 derivedCommandId policy (StreamId stream) (Sequence seq) index =
-  CommandId (policy <> ":" <> stream <> "@" <> show seq <> "#" <> show index)
+  Derived (policy <> ":" <> stream <> "@" <> show seq <> "#" <> show index)

@@ -60,12 +60,14 @@ module Domain
 
 import Prelude
 
-import Data.Array (mapWithIndex)
+import Data.Array (last, mapWithIndex, scanl)
 import Data.Bifunctor (bimap)
 import Data.DateTime.Instant (Instant)
 import Data.Either (Either(..))
 import Data.Foldable (foldl)
-import Data.Maybe (Maybe(..), maybe)
+import Data.Map (Map)
+import Data.Map as Map
+import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Symbol (class IsSymbol, reflectSymbol)
 import Data.Variant (class VariantShows, Unvariant(..), Variant, unvariant)
 import Data.Variant.Internal (class VariantTags, VariantRep(..))
@@ -84,8 +86,6 @@ import Domain.Id
   )
 import Domain.Id (derivedCommandId)
 import Domain.Labels (class Covers, class Field, class IsVariant, class SubRow)
-import Foreign.Object (Object)
-import Foreign.Object as Object
 import Partial.Unsafe (unsafeCrashWith)
 import Prim.Row as Row
 import Prim.RowList (class RowToList, Cons, Nil, RowList)
@@ -308,21 +308,25 @@ aggregate definition = Aggregate (erase typed)
 decider :: forall spec id s c e r b. Spec spec id s c e r b => Aggregate spec -> Decider spec s b
 decider (Aggregate erased) = unerase erased
 
--- | Decide, then fold the new events into the state.
+-- | Decide, then fold the new events into the state. `states` holds the
+-- | state right after each event.
 commit ::
   forall spec id s c e r b.
   Spec spec id s c e r b =>
   Aggregate spec ->
   s ->
   Command spec ->
-  Either (Rejection spec) { state :: s, events :: Array (Event spec), reply :: b }
+  Either
+    (Rejection spec)
+    { state :: s, states :: Array s, events :: Array (Event spec), reply :: b }
 commit aggregate' state command = do
   let
     d = decider aggregate'
   events <- d.decide state command
   let
-    next = foldl d.evolve state events
-  pure { state: next, events, reply: d.reply next }
+    states = scanl d.evolve state events
+    next = fromMaybe state (last states)
+  pure { state: next, states, events, reply: d.reply next }
 
 -- | Replay is a fold, so `replay a s (xs <> ys) == replay a (replay a s xs) ys`.
 replay ::
@@ -453,7 +457,7 @@ policy ::
   Policy src tgt
 policy handlers = Policy (erase typed)
   where
-  typed :: Object (id -> Erased -> Array (Order tgt))
+  typed :: Map String (id -> Erased -> Array (Order tgt))
   typed = table (Proxy :: Proxy "a policy reacts to an undeclared event ") (Proxy :: Proxy erl)
     (Proxy :: Proxy hrl) handlers
 
@@ -487,7 +491,7 @@ orders ::
 orders name (Policy handlers) envelope =
   mapWithIndex address (dispatch typed (\_ -> []) envelope.id (toVariant envelope.event))
   where
-  typed :: Object (sid -> Erased -> Array (Order tgt))
+  typed :: Map String (sid -> Erased -> Array (Order tgt))
   typed = unerase handlers
 
   address index (Order placed) =
@@ -510,22 +514,25 @@ type Envelope id ev =
 -- | same receipt.
 type Receipt ev b = { commandId :: CommandId, version :: Version, events :: Array ev, reply :: b }
 
-dispatch :: forall x row out. Object (x -> Erased -> out) -> (x -> out) -> x -> Variant row -> out
+dispatch ::
+  forall x row out. Map String (x -> Erased -> out) -> (x -> out) -> x -> Variant row -> out
 dispatch handlers fallback x v =
   let
     { type: tag, value } = untag v
   in
-    maybe (fallback x) (\handler -> handler x value) (Object.lookup tag handlers)
+    maybe (fallback x) (\handler -> handler x value) (Map.lookup tag handlers)
 
 -- | Builds the `decide` dispatch table. Each handler's payload comes from
 -- | the spec, and its narrow rows must be sub-rows of the spec's.
 class DecideTable :: RowList Type -> Row Type -> Type -> Type -> Constraint
 class DecideTable rl hs s spec where
   decideTable ::
-    Proxy rl -> Record hs -> Object (s -> Erased -> Either (Rejection spec) (Array (Event spec)))
+    Proxy rl ->
+    Record hs ->
+    Map String (s -> Erased -> Either (Rejection spec) (Array (Event spec)))
 
 instance DecideTable Nil hs s spec where
-  decideTable _ _ = Object.empty
+  decideTable _ _ = Map.empty
 
 instance ( IsSymbol l
          , Spec spec id s c e r b
@@ -542,7 +549,7 @@ instance ( IsSymbol l
          ) =>
   DecideTable (Cons l h t) hs s spec where
   decideTable _ handlers =
-    Object.insert (reflectSymbol (Proxy :: Proxy l)) run (decideTable (Proxy :: Proxy t) handlers)
+    Map.insert (reflectSymbol (Proxy :: Proxy l)) run (decideTable (Proxy :: Proxy t) handlers)
     where
     run state payload =
       bimap (fromVariant <<< widen @"a decide handler rejects with an undeclared rejection ")
@@ -553,10 +560,10 @@ instance ( IsSymbol l
 -- | where each payload type comes from `labels`.
 class Table :: Symbol -> RowList Type -> Row Type -> RowList Type -> Type -> Type -> Constraint
 class Table what rl hs labels x out where
-  table :: Proxy what -> Proxy labels -> Proxy rl -> Record hs -> Object (x -> Erased -> out)
+  table :: Proxy what -> Proxy labels -> Proxy rl -> Record hs -> Map String (x -> Erased -> out)
 
 instance Table what Nil hs labels x out where
-  table _ _ _ _ = Object.empty
+  table _ _ _ _ = Map.empty
 
 instance ( IsSymbol l
          , Field what l labels a
@@ -564,6 +571,6 @@ instance ( IsSymbol l
          , Table what t hs labels x out
          ) =>
   Table what (Cons l h t) hs labels x out where
-  table what labels _ handlers = Object.insert (reflectSymbol (Proxy :: Proxy l))
+  table what labels _ handlers = Map.insert (reflectSymbol (Proxy :: Proxy l))
     (\x payload -> Record.get (Proxy :: Proxy l) handlers x (unerase payload))
     (table what labels (Proxy :: Proxy t) handlers)

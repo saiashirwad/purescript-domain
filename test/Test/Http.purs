@@ -47,6 +47,8 @@ testHttp = do
   retried <- post sam "/account/a-1/openAccount" "k-open" (encodeJson { owner: "sam" })
   assertEqual "a retried key returns the same status" 200 retried.status
   assertEqual "a retried key returns the same body" (stringify opened.body) (stringify retried.body)
+  reused <- post sam "/account/a-1/depositMoney" "k-open" (encodeJson { amount: 5 })
+  assertEqual "a key reused for another command is 422" 422 reused.status
 
   overdraw <- post sam "/account/a-1/withdrawMoney" "k-withdraw" (encodeJson { amount: 5 })
   assertEqual "a rejection is a 409" 409 overdraw.status
@@ -75,6 +77,8 @@ testHttp = do
   assertEqual "an unknown command is 400" 400 unknownCommand.status
   unknownRoute <- post sam "/nothing/a-1/openAccount" "k-x" jsonEmptyObject
   assertEqual "an unknown aggregate is 404" 404 unknownRoute.status
+  prototypeRoute <- post sam "/constructor/a-1/openAccount" "k-p" jsonEmptyObject
+  assertEqual "a label inherited by every JavaScript object is no route" 404 prototypeRoute.status
   shortPath <- get sam "/account" []
   assertEqual "a path without an id is 404" 404 shortPath.status
   wrongMethod <- get sam "/account/a-1/openAccount" []

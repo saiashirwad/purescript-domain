@@ -2,7 +2,8 @@
 -- | status codes all come from the context's labels and specs:
 -- |
 -- | - `POST /<aggregate>/<id>/<command>` with an `Idempotency-Key` header
--- |   sends the command. 200 returns the receipt, 409 the rejection.
+-- |   sends the command. 200 returns the receipt, 409 the rejection, and
+-- |   422 says the key already names another command.
 -- | - `GET /<view>/<key>` reads the view's row.
 -- |
 -- | The only hand-written input is `guards`: one `principal -> id ->
@@ -27,10 +28,8 @@ import Domain
   (class Spec, Aggregate, Command, Event, Policy, Rejection, View, parseCommandId, versionNumber)
 import Domain.Codec (class DecodeCases, class EncodeCases, decode, encode, labelled, tagged)
 import Domain.Labels (class Field)
-import Domain.Runtime (AggregateHandle, ViewHandle)
+import Domain.Runtime (AggregateHandle, Refusal(..), ViewHandle)
 import Effect.Aff (Aff)
-import Foreign.Object (Object)
-import Foreign.Object as Object
 import Prim.Row as Row
 import Prim.RowList (class RowToList, Cons, Nil, RowList)
 import Record as Record
@@ -68,7 +67,7 @@ serve ::
 serve _ guards rt = \principal request ->
   case Array.filter (_ /= "") (split (Pattern "/") request.path) # uncons of
     Just { head: label, tail }
-      | Just { head: id, tail: rest } <- uncons tail -> case Object.lookup label table of
+      | Just { head: id, tail: rest } <- uncons tail -> case Map.lookup label table of
         Nothing -> pure (failure 404 ("no route for " <> request.path))
         Just route
           | route.method /= request.method ->
@@ -114,7 +113,10 @@ commandRoute guard handle =
           Right (sent :: Command spec) -> do
             result <- handle.send commandId id sent
             pure case result of
-              Left (refused :: Rejection spec) -> { status: 409, body: encode labelled refused }
+              Left (Rejected (refused :: Rejection spec)) ->
+                { status: 409, body: encode labelled refused }
+              Left (Reused reused) ->
+                failure 422 ("the Idempotency-Key already names the command " <> reused.command)
               Right receipt ->
                 { status: 200
                 , body: encodeJson
@@ -152,10 +154,10 @@ viewRoute guard handle =
 -- | error naming the label.
 class Routes :: RowList Type -> Row Type -> Row Type -> Type -> Constraint
 class Routes rl guards rt principal where
-  routes :: Proxy rl -> Record guards -> Record rt -> Object (Route principal)
+  routes :: Proxy rl -> Record guards -> Record rt -> Map String (Route principal)
 
 instance Routes Nil guards rt principal where
-  routes _ _ _ = Object.empty
+  routes _ _ _ = Map.empty
 
 instance ( IsSymbol l
          , Spec spec id s c e r b
@@ -176,7 +178,7 @@ instance ( IsSymbol l
          , Routes t guards rt principal
          ) =>
   Routes (Cons l (Aggregate spec) t) guards rt principal where
-  routes _ guards rt = Object.insert (reflectSymbol (Proxy :: Proxy l))
+  routes _ guards rt = Map.insert (reflectSymbol (Proxy :: Proxy l))
     ( commandRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards)
         (Record.get (Proxy :: Proxy l) rt)
     )
@@ -190,7 +192,7 @@ else instance ( IsSymbol l
               , Routes t guards rt principal
               ) =>
   Routes (Cons l (View spec k v) t) guards rt principal where
-  routes _ guards rt = Object.insert (reflectSymbol (Proxy :: Proxy l))
+  routes _ guards rt = Map.insert (reflectSymbol (Proxy :: Proxy l))
     ( viewRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards)
         (Record.get (Proxy :: Proxy l) rt)
     )
