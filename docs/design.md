@@ -28,7 +28,7 @@ Commands, events, and rejections derive `Generic`. `Domain.Internal.Labels` turn
 
 A view's input is a `Change id s e`, the record `{ id, state, event }`: a committed event, the id of its stream, and the stream's state right after it. `View i k v` pairs a fold with a key function `i -> Maybe k`. The runtime keeps one fold per key and steps it with each change routed to that key. `Nothing` skips the change. `byId` keys by the change's `id`. `keyed` takes any key function.
 
-The bank's dashboard uses `keyed (customerOf <<< _.state)` to fold every account a customer owns into one row, so `MoneyDeposited` does not need to carry the customer. Two other key sources were rejected:
+The bank's dashboard uses `keyed owner`, where `owner = customerOf <<< _.state`, to fold every account a customer owns into one row, so `MoneyDeposited` does not need to carry the customer. Two other key sources were rejected:
 
 - Deriving the key from the id, as in `AccountId { customer, number }`, needs a library-defined text codec for every id, freezes ownership, and makes every account id name a customer.
 - Learning a routing table from `AccountOpened` repeats inside the view a fold of ownership that `evolve` already does, and it is hidden state per view.

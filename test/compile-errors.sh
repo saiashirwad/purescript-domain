@@ -82,8 +82,8 @@ expect "evolve misses an event" src/Bank/Account.purs \
 " "" \
   "Pattern match is not exhaustive. Missing: MoneyWithdrawn _"
 expect "view misses an event" src/Bank/Views.purs \
-  '  MoneyWithdrawn { amount, balanceAfter } -> [ { kind: "withdrawal", amount, balance: balanceAfter } ]
-' "" \
+  "    MoneyWithdrawn movement -> [ line Withdrawal movement ]
+" "" \
   "Pattern match is not exhaustive. Missing: MoneyWithdrawn _"
 expect "guard misses a command" src/Bank/Api.purs \
   "      WithdrawMoney _ -> ownsAccount principal id

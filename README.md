@@ -172,7 +172,7 @@ A view is a read model with one row per key. Each row is a fold over changes. A 
 type AccountChange = Change AccountId AccountState AccountEvent
 ```
 
-`Fold.fold` takes an initial row and a step function. `byId` keeps one row per aggregate id.
+`Fold.fold` takes an initial row and a step function, named in a `where` clause. `byId` keeps one row per aggregate id.
 
 ```purescript
 import Domain (View, byId, keyed)
@@ -183,20 +183,46 @@ import Domain.Fold as Fold
 type Summary = { owner :: Maybe CustomerId, balance :: Int }
 
 summary :: View AccountChange AccountId Summary
-summary = byId $ Fold.fold { owner: Nothing, balance: 0 } \row { event } -> case event of
-  AccountOpened { owner } -> row { owner = Just owner }
-  MoneyDeposited { balanceAfter } -> row { balance = balanceAfter }
-  MoneyWithdrawn { balanceAfter } -> row { balance = balanceAfter }
+summary = byId (Fold.fold initial step)
+  where
+  initial = { owner: Nothing, balance: 0 }
+
+  step row { event } = case event of
+    AccountOpened { owner } -> row { owner = Just owner }
+    MoneyDeposited { balanceAfter } -> row { balance = balanceAfter }
+    MoneyWithdrawn { balanceAfter } -> row { balance = balanceAfter }
 ```
 
-A row that collects values is a `Fold.foldMap` into a monoid. The statement appends one line per movement:
+A row that collects values is a `Fold.foldMap` into a monoid. The statement appends one line per movement, and an `Entry` says which way the money moved:
+
+```purescript
+-- | Which way money moved. Encodes as `"deposit"` or `"withdrawal"`.
+data Entry = Deposit | Withdrawal
+
+derive instance Eq Entry
+
+instance Show Entry where
+  show Deposit = "Deposit"
+  show Withdrawal = "Withdrawal"
+
+instance EncodeJson Entry where
+  encodeJson Deposit = encodeJson "deposit"
+  encodeJson Withdrawal = encodeJson "withdrawal"
+
+type StatementLine = { kind :: Entry, amount :: Int, balance :: Int }
+```
 
 ```purescript
 statement :: View AccountChange AccountId (Array StatementLine)
-statement = byId $ Fold.foldMap \{ event } -> case event of
-  AccountOpened _ -> []
-  MoneyDeposited { amount, balanceAfter } -> [ { kind: "deposit", amount, balance: balanceAfter } ]
-  MoneyWithdrawn { amount, balanceAfter } -> [ { kind: "withdrawal", amount, balance: balanceAfter } ]
+statement = byId (Fold.foldMap lines)
+  where
+  lines { event } = case event of
+    AccountOpened _ -> []
+    MoneyDeposited movement -> [ line Deposit movement ]
+    MoneyWithdrawn movement -> [ line Withdrawal movement ]
+
+  line :: Entry -> Movement -> StatementLine
+  line kind { amount, balanceAfter } = { kind, amount, balance: balanceAfter }
 ```
 
 `Fold` is also a `Functor`, an `Applicative`, and a `Profunctor`, so you can combine two folds with `<$>` and `<*>`, or adapt a fold's input with `Fold.premap`. `test/Test/Fold.purs` has examples.
@@ -217,8 +243,13 @@ type Dashboard = { accounts :: Int, balance :: Int }
 
 ```purescript
 dashboard :: View AccountChange CustomerId Dashboard
-dashboard = keyed (customerOf <<< _.state) $ Fold.fold { accounts: 0, balance: 0 } \row { event } ->
-  case event of
+dashboard = keyed owner (Fold.fold initial step)
+  where
+  owner = customerOf <<< _.state
+
+  initial = { accounts: 0, balance: 0 }
+
+  step row { event } = case event of
     AccountOpened _ -> row { accounts = row.accounts + 1 }
     MoneyDeposited { amount } -> row { balance = row.balance + amount }
     MoneyWithdrawn { amount } -> row { balance = row.balance - amount }

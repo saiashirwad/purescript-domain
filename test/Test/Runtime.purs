@@ -6,6 +6,7 @@ import Bank (bank)
 import Bank.Account (AccountCommand(..), AccountEvent(..), AccountId(..), AccountRejection(..))
 import Bank.Customer (CustomerCommand(..), CustomerId(..), CustomerRejection(..))
 import Bank.Policy (mainAccount)
+import Bank.Views (Entry(..))
 import Data.Array (length, range)
 import Data.Either (Either(..), isLeft)
 import Data.Foldable (for_)
@@ -111,8 +112,8 @@ views = do
   statement <- rt.statement.read sam
   assertEqual "duplicate delivery does not double-apply"
     ( Just
-        [ { kind: "deposit", amount: 100, balance: 100 }
-        , { kind: "withdrawal", amount: 30, balance: 70 }
+        [ { kind: Deposit, amount: 100, balance: 100 }
+        , { kind: Withdrawal, amount: 30, balance: 70 }
         ]
     )
     statement
