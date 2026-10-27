@@ -20,15 +20,22 @@ testTrace :: Aff Unit
 testTrace = do
   { options, spans } <- recordingOptions
   rt <- start bank options
-  let sam = AccountId "a-1"
+  let
+    sam = AccountId "a-1"
   _ <- rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" })
   _ <- rt.account.send (commandId "overdraw") sam (cmd @"withdrawMoney" { amount: 5 })
   _ <- rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" })
-  _ <- rt.customer.send (commandId "register") (CustomerId "c-1") (cmd @"registerCustomer" { name: "ada" })
+  _ <- rt.customer.send (commandId "register") (CustomerId "c-1")
+    (cmd @"registerCustomer" { name: "ada" })
   rt.stop
   recorded <- liftEffect (Ref.read spans)
   assertEqual "a span per command, the policy's order before the command that caused it"
-    [ "command.account", "command.account", "command.account", "command.account", "command.customer" ]
+    [ "command.account"
+    , "command.account"
+    , "command.account"
+    , "command.account"
+    , "command.customer"
+    ]
     (map _.name recorded)
   committed <- spanAt 0 recorded
   assertEqual "a committed command's attributes"
@@ -56,9 +63,11 @@ testTrace = do
     )
     rejected.attributes
   duplicate <- spanAt 2 recorded
-  assertEqual "a retried command is marked a duplicate" (Just "duplicate") (Map.lookup "outcome" duplicate.attributes)
+  assertEqual "a retried command is marked a duplicate" (Just "duplicate")
+    (Map.lookup "outcome" duplicate.attributes)
   registered <- spanAt 4 recorded
-  assertEqual "a policy's orders are counted on the triggering span" (Just "1") (Map.lookup "policy.orders" registered.attributes)
+  assertEqual "a policy's orders are counted on the triggering span" (Just "1")
+    (Map.lookup "policy.orders" registered.attributes)
   where
   spanAt :: Int -> Array Span -> Aff Span
   spanAt n spans = case index spans n of

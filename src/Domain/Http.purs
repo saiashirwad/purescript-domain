@@ -7,20 +7,14 @@
 -- |
 -- | The only hand-written input is `guards`: one `principal -> id ->
 -- | Boolean` per aggregate and view label.
-module Domain.Http
-  ( Method(..)
-  , Request
-  , Response
-  , serve
-  , class Routes
-  , routes
-  ) where
+module Domain.Http (Method(..), Request, Response, serve, class Routes, routes) where
 
 import Prelude
 
 import Data.Argonaut.Core (Json)
 import Data.Argonaut.Encode (class EncodeJson, encodeJson)
 import Data.Array (uncons)
+import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Int as Int
 import Data.Map (Map)
@@ -28,9 +22,19 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), maybe)
 import Data.Newtype (class Newtype, wrap)
 import Data.String (Pattern(..), split)
-import Data.Array as Array
 import Data.Symbol (class IsSymbol, reflectSymbol)
-import Domain (class Spec, Aggregate, Command, Event, Policy, Rejection, View, parseCommandId, parseVersion, versionNumber)
+import Domain
+  ( class Spec
+  , Aggregate
+  , Command
+  , Event
+  , Policy
+  , Rejection
+  , View
+  , parseCommandId
+  , parseVersion
+  , versionNumber
+  )
 import Domain.Codec (class DecodeCases, class EncodeCases, decode, encode, labelled, tagged)
 import Domain.Labels (class Field)
 import Domain.Runtime (AggregateHandle, ViewHandle)
@@ -59,27 +63,26 @@ type Request =
 type Response = { status :: Int, body :: Json }
 
 type Route principal =
-  { method :: Method
-  , handle :: principal -> String -> Array String -> Request -> Aff Response
-  }
+  { method :: Method, handle :: principal -> String -> Array String -> Request -> Aff Response }
 
-serve
-  :: forall ctx rl guards rt principal
-   . RowToList ctx rl
-  => Routes rl guards rt principal
-  => Record ctx
-  -> Record guards
-  -> Record rt
-  -> principal
-  -> Request
-  -> Aff Response
+serve ::
+  forall ctx rl guards rt principal.
+  RowToList ctx rl =>
+  Routes rl guards rt principal =>
+  Record ctx ->
+  Record guards ->
+  Record rt ->
+  principal ->
+  Request ->
+  Aff Response
 serve _ guards rt = \principal request ->
   case Array.filter (_ /= "") (split (Pattern "/") request.path) # uncons of
-    Just { head: label, tail } | Just { head: id, tail: rest } <- uncons tail ->
-      case Object.lookup label table of
+    Just { head: label, tail }
+      | Just { head: id, tail: rest } <- uncons tail -> case Object.lookup label table of
         Nothing -> pure (failure 404 ("no route for " <> request.path))
         Just route
-          | route.method /= request.method -> pure (failure 405 (label <> " does not accept this method"))
+          | route.method /= request.method ->
+            pure (failure 405 (label <> " does not accept this method"))
           | otherwise -> route.handle principal id rest request
     _ -> pure (failure 404 ("no route for " <> request.path))
   where
@@ -91,29 +94,31 @@ failure status message = { status, body: encodeJson { error: message } }
 forbidden :: Response
 forbidden = failure 403 "the principal may not perform this operation"
 
-commandRoute
-  :: forall spec id s c e r b crl erl rrl principal
-   . Spec spec id s c e r b
-  => Newtype id String
-  => RowToList c crl
-  => RowToList e erl
-  => RowToList r rrl
-  => EncodeCases crl c
-  => DecodeCases crl c
-  => EncodeCases erl e
-  => DecodeCases erl e
-  => EncodeCases rrl r
-  => DecodeCases rrl r
-  => EncodeJson b
-  => (principal -> id -> Boolean)
-  -> AggregateHandle spec id b
-  -> Route principal
+commandRoute ::
+  forall spec id s c e r b crl erl rrl principal.
+  Spec spec id s c e r b =>
+  Newtype id String =>
+  RowToList c crl =>
+  RowToList e erl =>
+  RowToList r rrl =>
+  EncodeCases crl c =>
+  DecodeCases crl c =>
+  EncodeCases erl e =>
+  DecodeCases erl e =>
+  EncodeCases rrl r =>
+  DecodeCases rrl r =>
+  EncodeJson b =>
+  (principal -> id -> Boolean) ->
+  AggregateHandle spec id b ->
+  Route principal
 commandRoute guard handle =
   { method: POST
   , handle: \principal rawId rest request -> do
-      let id = wrap rawId
+      let
+        id = wrap rawId
       case rest, Map.lookup "idempotency-key" request.headers >>= parseCommandId of
-        _, _ | not (guard principal id) -> pure forbidden
+        _, _
+          | not (guard principal id) -> pure forbidden
         [ name ], Just commandId -> case decode labelled (tagged name request.body) of
           Left message -> pure (failure 400 message)
           Right (sent :: Command spec) -> do
@@ -132,24 +137,28 @@ commandRoute guard handle =
         _, _ -> pure (failure 404 ("no route for " <> request.path))
   }
 
-viewRoute
-  :: forall id v principal
-   . Newtype id String
-  => EncodeJson v
-  => (principal -> id -> Boolean)
-  -> ViewHandle id v
-  -> Route principal
+viewRoute ::
+  forall id v principal.
+  Newtype id String =>
+  EncodeJson v =>
+  (principal -> id -> Boolean) ->
+  ViewHandle id v ->
+  Route principal
 viewRoute guard handle =
   { method: GET
   , handle: \principal rawId rest request -> do
-      let id = wrap rawId
-      if not (guard principal id) then pure forbidden
-      else if rest /= [] then pure (failure 404 ("no route for " <> request.path))
+      let
+        id = wrap rawId
+      if not (guard principal id)
+      then pure forbidden
+      else if rest /= []
+      then pure (failure 404 ("no route for " <> request.path))
       else case Map.lookup "atLeast" request.query of
         Nothing -> found <$> handle.read id
         Just raw -> case Int.fromString raw >>= parseVersion of
           Nothing -> pure (failure 400 ("invalid atLeast version: " <> raw))
-          Just version -> maybe (failure 408 "the view did not catch up") ok <$> handle.readAt version id
+          Just version ->
+            maybe (failure 408 "the view did not catch up") ok <$> handle.readAt version id
   }
   where
   found = maybe (failure 404 "nothing recorded for this id") ok
@@ -164,46 +173,45 @@ class Routes rl guards rt principal where
 instance Routes Nil guards rt principal where
   routes _ _ _ = Object.empty
 
-instance
-  ( IsSymbol l
-  , Spec spec id s c e r b
-  , Newtype id String
-  , RowToList guards grl
-  , Field "serve needs a guard for " l grl (principal -> id -> Boolean)
-  , Row.Cons l (AggregateHandle spec id b) rtTail rt
-  , RowToList c crl
-  , RowToList e erl
-  , RowToList r rrl
-  , EncodeCases crl c
-  , DecodeCases crl c
-  , EncodeCases erl e
-  , DecodeCases erl e
-  , EncodeCases rrl r
-  , DecodeCases rrl r
-  , EncodeJson b
-  , Routes t guards rt principal
-  ) =>
+instance ( IsSymbol l
+         , Spec spec id s c e r b
+         , Newtype id String
+         , RowToList guards grl
+         , Field "serve needs a guard for " l grl (principal -> id -> Boolean)
+         , Row.Cons l (AggregateHandle spec id b) rtTail rt
+         , RowToList c crl
+         , RowToList e erl
+         , RowToList r rrl
+         , EncodeCases crl c
+         , DecodeCases crl c
+         , EncodeCases erl e
+         , DecodeCases erl e
+         , EncodeCases rrl r
+         , DecodeCases rrl r
+         , EncodeJson b
+         , Routes t guards rt principal
+         ) =>
   Routes (Cons l (Aggregate spec) t) guards rt principal where
-  routes _ guards rt =
-    Object.insert (reflectSymbol (Proxy :: Proxy l))
-      (commandRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards) (Record.get (Proxy :: Proxy l) rt))
-      (routes (Proxy :: Proxy t) guards rt)
-
-else instance
-  ( IsSymbol l
-  , Spec spec id s c e r b
-  , Newtype id String
-  , EncodeJson v
-  , RowToList guards grl
-  , Field "serve needs a guard for " l grl (principal -> id -> Boolean)
-  , Row.Cons l (ViewHandle id v) rtTail rt
-  , Routes t guards rt principal
-  ) =>
+  routes _ guards rt = Object.insert (reflectSymbol (Proxy :: Proxy l))
+    ( commandRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards)
+        (Record.get (Proxy :: Proxy l) rt)
+    )
+    (routes (Proxy :: Proxy t) guards rt)
+else instance ( IsSymbol l
+              , Spec spec id s c e r b
+              , Newtype id String
+              , EncodeJson v
+              , RowToList guards grl
+              , Field "serve needs a guard for " l grl (principal -> id -> Boolean)
+              , Row.Cons l (ViewHandle id v) rtTail rt
+              , Routes t guards rt principal
+              ) =>
   Routes (Cons l (View spec v) t) guards rt principal where
-  routes _ guards rt =
-    Object.insert (reflectSymbol (Proxy :: Proxy l))
-      (viewRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards) (Record.get (Proxy :: Proxy l) rt))
-      (routes (Proxy :: Proxy t) guards rt)
-
-else instance Routes t guards rt principal => Routes (Cons l (Policy src tgt) t) guards rt principal where
+  routes _ guards rt = Object.insert (reflectSymbol (Proxy :: Proxy l))
+    ( viewRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards)
+        (Record.get (Proxy :: Proxy l) rt)
+    )
+    (routes (Proxy :: Proxy t) guards rt)
+else instance Routes t guards rt principal =>
+  Routes (Cons l (Policy src tgt) t) guards rt principal where
   routes _ = routes (Proxy :: Proxy t)

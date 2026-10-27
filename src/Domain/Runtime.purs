@@ -26,17 +26,18 @@ module Domain.Runtime
   , class Wire
   , wire
   , class FindAggregate
-  ) where
+  )
+  where
 
 import Prelude
 
 import Data.Array (concatMap, intercalate, length, zipWith)
+import Data.Array as Array
 import Data.CatQueue (CatQueue)
 import Data.CatQueue as CatQueue
 import Data.DateTime.Instant (Instant, diff)
 import Data.Either (Either(..))
 import Data.Foldable (foldl, for_, sum)
-import Data.Array as Array
 import Data.JSDate as JSDate
 import Data.Map (Map)
 import Data.Map as Map
@@ -86,8 +87,8 @@ import Effect.Aff.AVar as AVar
 import Effect.Class (liftEffect)
 import Effect.Exception (error)
 import Effect.Ref (Ref)
-import Partial.Unsafe (unsafeCrashWith)
 import Effect.Ref as Ref
+import Partial.Unsafe (unsafeCrashWith)
 import Prim.Row as Row
 import Prim.RowList (class RowToList, Cons, Nil, RowList)
 import Prim.TypeError (class Fail, Above, Beside, Quote, QuoteLabel, Text)
@@ -108,17 +109,9 @@ type Span =
 -- | Test seams around each command's turn on its stream. A failing
 -- | `beforeCommand` aborts before the commit; a failing `afterCommand`
 -- | reports a failure after it.
-type Hooks =
-  { beforeCommand :: StreamId -> Aff Unit
-  , afterCommand :: StreamId -> Aff Unit
-  }
+type Hooks = { beforeCommand :: StreamId -> Aff Unit, afterCommand :: StreamId -> Aff Unit }
 
-type Options =
-  { now :: Aff Instant
-  , trace :: Span -> Aff Unit
-  , capacity :: Int
-  , hooks :: Hooks
-  }
+type Options = { now :: Aff Instant, trace :: Span -> Aff Unit, capacity :: Int, hooks :: Hooks }
 
 defaults :: Options
 defaults =
@@ -132,7 +125,8 @@ defaults =
   }
 
 type AggregateHandle spec id b =
-  { send :: CommandId -> id -> Command spec -> Aff (Either (Rejection spec) (Receipt (Event spec) b))
+  { send ::
+      CommandId -> id -> Command spec -> Aff (Either (Rejection spec) (Receipt (Event spec) b))
   , history :: id -> Aff (Array (Envelope id (Event spec)))
   }
 
@@ -147,15 +141,15 @@ type ViewHandle id v =
 -- | handle per aggregate and view label, plus `stop`, which refuses new
 -- | commands, lets in-flight commands and their policy cascades finish,
 -- | and drains every stream.
-start
-  :: forall ctx rl hosts rt
-   . RowToList ctx rl
-  => Hosts rl ctx hosts
-  => Wire rl rl ctx hosts rt
-  => Row.Lacks "stop" rt
-  => Record ctx
-  -> Options
-  -> Aff (Record (stop :: Aff Unit | rt))
+start ::
+  forall ctx rl hosts rt.
+  RowToList ctx rl =>
+  Hosts rl ctx hosts =>
+  Wire rl rl ctx hosts rt =>
+  Row.Lacks "stop" rt =>
+  Record ctx ->
+  Options ->
+  Aff (Record (stop :: Aff Unit | rt))
 start ctx options = liftEffect do
   system <- newSystem options
   hosts <- Builder.buildFromScratch <$> makeHosts (Proxy :: Proxy rl) ctx system
@@ -208,42 +202,36 @@ stopSystem system = do
 -- | `send` skips the stop gate and is for policies only.
 type Host spec id b =
   { handle :: AggregateHandle spec id b
-  , send :: CommandId -> id -> Command spec -> Aff (Either (Rejection spec) (Receipt (Event spec) b))
+  , send ::
+      CommandId -> id -> Command spec -> Aff (Either (Rejection spec) (Receipt (Event spec) b))
   , onCommit :: (Array (Envelope id (Event spec)) -> Effect Unit) -> Effect Unit
   , afterCommit :: (Array (Envelope id (Event spec)) -> Aff Int) -> Effect Unit
   }
 
 type Stream id s spec =
-  { state :: s
-  , version :: Version
-  , history :: CatQueue (Envelope id (Event spec))
-  }
+  { state :: s, version :: Version, history :: CatQueue (Envelope id (Event spec)) }
 
 type Stored id spec b =
-  { receipt :: Receipt (Event spec) b
-  , envelopes :: Array (Envelope id (Event spec))
-  }
+  { receipt :: Receipt (Event spec) b, envelopes :: Array (Envelope id (Event spec)) }
 
 -- | Receipts are kept per aggregate: a command id names one command to one
 -- | aggregate, so a retry finds its receipt and commits nothing new.
 type Store id s spec b =
-  { streams :: Map String (Stream id s spec)
-  , receipts :: Map CommandId (Stored id spec b)
-  }
+  { streams :: Map String (Stream id s spec), receipts :: Map CommandId (Stored id spec b) }
 
 data Outcome id spec b
   = Committed (Stored id spec b)
   | Duplicate (Stored id spec b)
   | Refused (Rejection spec)
 
-newHost
-  :: forall spec id s c e r b
-   . Spec spec id s c e r b
-  => Newtype id String
-  => System
-  -> String
-  -> Aggregate spec
-  -> Effect (Host spec id b)
+newHost ::
+  forall spec id s c e r b.
+  Spec spec id s c e r b =>
+  Newtype id String =>
+  System ->
+  String ->
+  Aggregate spec ->
+  Effect (Host spec id b)
 newHost system name aggregate = do
   store <- Ref.new ({ streams: Map.empty, receipts: Map.empty } :: Store id s spec b)
   views <- Ref.new ([] :: Array (Array (Envelope id (Event spec)) -> Effect Unit))
@@ -262,20 +250,19 @@ newHost system name aggregate = do
       case Map.lookup commandId current.receipts of
         Just stored -> pure (Duplicate stored)
         Nothing -> do
-          let streamState = fromMaybe empty (Map.lookup (unwrap id) current.streams)
+          let
+            streamState = fromMaybe empty (Map.lookup (unwrap id) current.streams)
           case commit aggregate streamState.state sent of
             Left refused -> pure (Refused refused)
             Right committed -> do
               let
                 count = length committed.events
-                envelopes =
-                  zipWith
-                    (\seq fact -> { id, stream, seq, commandId, at, event: fact })
-                    (sequencesAfter streamState.version count)
-                    committed.events
+                envelopes = zipWith (\seq fact -> { id, stream, seq, commandId, at, event: fact })
+                  (sequencesAfter streamState.version count) committed.events
                 version = advance streamState.version count
                 stored =
-                  { receipt: { commandId, version, events: committed.events, reply: committed.reply }
+                  { receipt:
+                      { commandId, version, events: committed.events, reply: committed.reply }
                   , envelopes
                   }
                 next =
@@ -300,9 +287,11 @@ newHost system name aggregate = do
       subscribers <- liftEffect (Ref.read policies)
       sum <$> for subscribers (_ $ envelopes)
 
-    send :: CommandId -> id -> Command spec -> Aff (Either (Rejection spec) (Receipt (Event spec) b))
+    send ::
+      CommandId -> id -> Command spec -> Aff (Either (Rejection spec) (Receipt (Event spec) b))
     send commandId id sent = do
-      let stream = streamOf name (unwrap id)
+      let
+        stream = streamOf name (unwrap id)
       startedAt <- options.now
       outcome <- Serial.run system.serial (streamIdText stream) do
         options.hooks.beforeCommand stream
@@ -338,27 +327,26 @@ newHost system name aggregate = do
     , afterCommit: \subscriber -> Ref.modify_ (_ <> [ subscriber ]) policies
     }
 
-attributes
-  :: forall spec id s c e r b
-   . Spec spec id s c e r b
-  => CommandId
-  -> StreamId
-  -> Command spec
-  -> Outcome id spec b
-  -> Int
-  -> Map String String
-attributes commandId stream sent outcome ordered =
-  Map.fromFoldable
-    ( [ Tuple "command.id" (commandIdText commandId)
-      , Tuple "stream.id" (streamIdText stream)
-      , Tuple "command.name" (tagOf sent)
-      , Tuple "policy.orders" (show ordered)
-      ] <> case outcome of
+attributes ::
+  forall spec id s c e r b.
+  Spec spec id s c e r b =>
+  CommandId ->
+  StreamId ->
+  Command spec ->
+  Outcome id spec b ->
+  Int ->
+  Map String String
+attributes commandId stream sent outcome ordered = Map.fromFoldable
+  ( [ Tuple "command.id" (commandIdText commandId)
+    , Tuple "stream.id" (streamIdText stream)
+    , Tuple "command.name" (tagOf sent)
+    , Tuple "policy.orders" (show ordered)
+    ]
+      <> case outcome of
         Committed stored -> committedAttributes "committed" stored
         Duplicate stored -> committedAttributes "duplicate" stored
-        Refused refused ->
-          [ Tuple "outcome" "rejected", Tuple "rejection" (tagOf refused) ]
-    )
+        Refused refused -> [ Tuple "outcome" "rejected", Tuple "rejection" (tagOf refused) ]
+  )
   where
   committedAttributes label stored =
     [ Tuple "outcome" label
@@ -370,13 +358,13 @@ attributes commandId stream sent outcome ordered =
 -- | sequence makes redelivery harmless even when `step` is not idempotent.
 type Applied v = { state :: v, seen :: Sequence }
 
-newView
-  :: forall spec id s c e r b v
-   . Spec spec id s c e r b
-  => Newtype id String
-  => View spec v
-  -> Host spec id b
-  -> Effect (ViewHandle id v)
+newView ::
+  forall spec id s c e r b v.
+  Spec spec id s c e r b =>
+  Newtype id String =>
+  View spec v ->
+  Host spec id b ->
+  Effect (ViewHandle id v)
 newView definition host = do
   states <- Ref.new (Map.empty :: Map String (Applied v))
   host.onCommit \envelopes -> Ref.modify_ (\current -> foldl apply current envelopes) states
@@ -388,8 +376,10 @@ newView definition host = do
       poll attempts = do
         found <- liftEffect (Map.lookup (unwrap id) <$> Ref.read states)
         case found of
-          Just applied | sequenceNumber applied.seen >= versionNumber version -> pure (Just applied.state)
-          _ | attempts <= 0 -> pure Nothing
+          Just applied
+            | sequenceNumber applied.seen >= versionNumber version -> pure (Just applied.state)
+          _
+            | attempts <= 0 -> pure Nothing
           _ -> delay (Milliseconds 1.0) *> poll (attempts - 1)
   pure { read, readAt }
   where
@@ -401,28 +391,28 @@ newView definition host = do
       previous = Map.lookup key current
     in
       case previous of
-        Just applied | envelope.seq <= applied.seen -> current
-        _ ->
-          Map.insert key
-            { state: fold.step (maybe fold.initial _.state previous) envelope.event
-            , seen: envelope.seq
-            }
-            current
+        Just applied
+          | envelope.seq <= applied.seen -> current
+        _ -> Map.insert key
+          { state: fold.step (maybe fold.initial _.state previous) envelope.event
+          , seen: envelope.seq
+          }
+          current
 
-wirePolicy
-  :: forall src sid ss sc se sr sb tgt tid ts tc te tr tb
-   . Spec src sid ss sc se sr sb
-  => Spec tgt tid ts tc te tr tb
-  => String
-  -> Policy src tgt
-  -> Host src sid sb
-  -> Host tgt tid tb
-  -> Effect Unit
-wirePolicy name definition source target =
-  source.afterCommit \envelopes -> do
-    let addressed = concatMap (orders name definition) envelopes
-    for_ addressed \placed -> target.send placed.commandId placed.to placed.command
-    pure (length addressed)
+wirePolicy ::
+  forall src sid ss sc se sr sb tgt tid ts tc te tr tb.
+  Spec src sid ss sc se sr sb =>
+  Spec tgt tid ts tc te tr tb =>
+  String ->
+  Policy src tgt ->
+  Host src sid sb ->
+  Host tgt tid tb ->
+  Effect Unit
+wirePolicy name definition source target = source.afterCommit \envelopes -> do
+  let
+    addressed = concatMap (orders name definition) envelopes
+  for_ addressed \placed -> target.send placed.commandId placed.to placed.command
+  pure (length addressed)
 
 -- | Pass one: a host per aggregate entry, keyed by the entry's label.
 class Hosts :: RowList Type -> Row Type -> Row Type -> Constraint
@@ -432,21 +422,19 @@ class Hosts rl ctx hosts | rl -> hosts where
 instance Hosts Nil ctx () where
   makeHosts _ _ _ = pure identity
 
-instance
-  ( IsSymbol l
-  , Spec spec id s c e r b
-  , Newtype id String
-  , Row.Cons l (Aggregate spec) ctxTail ctx
-  , Hosts t ctx tailHosts
-  , Row.Cons l (Host spec id b) tailHosts hosts
-  , Row.Lacks l tailHosts
-  ) =>
+instance ( IsSymbol l
+         , Spec spec id s c e r b
+         , Newtype id String
+         , Row.Cons l (Aggregate spec) ctxTail ctx
+         , Hosts t ctx tailHosts
+         , Row.Cons l (Host spec id b) tailHosts hosts
+         , Row.Lacks l tailHosts
+         ) =>
   Hosts (Cons l (Aggregate spec) t) ctx hosts where
   makeHosts _ ctx system = do
     host <- newHost system (reflectSymbol (Proxy :: Proxy l)) (Record.get (Proxy :: Proxy l) ctx)
     rest <- makeHosts (Proxy :: Proxy t) ctx system
     pure (Builder.insert (Proxy :: Proxy l) host <<< rest)
-
 else instance Hosts t ctx hosts => Hosts (Cons l entry t) ctx hosts where
   makeHosts _ = makeHosts (Proxy :: Proxy t)
 
@@ -460,63 +448,57 @@ class Wire rl all ctx hosts rt | rl -> rt where
 instance Wire Nil all ctx hosts () where
   wire _ _ _ _ = pure identity
 
-instance
-  ( IsSymbol l
-  , Spec spec id s c e r b
-  , Row.Cons l (Host spec id b) hostsTail hosts
-  , Wire t all ctx hosts tailRt
-  , Row.Cons l (AggregateHandle spec id b) tailRt rt
-  , Row.Lacks l tailRt
-  ) =>
+instance ( IsSymbol l
+         , Spec spec id s c e r b
+         , Row.Cons l (Host spec id b) hostsTail hosts
+         , Wire t all ctx hosts tailRt
+         , Row.Cons l (AggregateHandle spec id b) tailRt rt
+         , Row.Lacks l tailRt
+         ) =>
   Wire (Cons l (Aggregate spec) t) all ctx hosts rt where
   wire _ all ctx hosts = do
-    let host = Record.get (Proxy :: Proxy l) hosts
+    let
+      host = Record.get (Proxy :: Proxy l) hosts
     rest <- wire (Proxy :: Proxy t) all ctx hosts
     pure (Builder.insert (Proxy :: Proxy l) host.handle <<< rest)
-
-else instance
-  ( IsSymbol l
-  , Spec spec id s c e r b
-  , Newtype id String
-  , FindAggregate spec all source
-  , IsSymbol source
-  , Row.Cons source (Host spec id b) hostsTail hosts
-  , Row.Cons l (View spec v) ctxTail ctx
-  , Wire t all ctx hosts tailRt
-  , Row.Cons l (ViewHandle id v) tailRt rt
-  , Row.Lacks l tailRt
-  ) =>
+else instance ( IsSymbol l
+              , Spec spec id s c e r b
+              , Newtype id String
+              , FindAggregate spec all source
+              , IsSymbol source
+              , Row.Cons source (Host spec id b) hostsTail hosts
+              , Row.Cons l (View spec v) ctxTail ctx
+              , Wire t all ctx hosts tailRt
+              , Row.Cons l (ViewHandle id v) tailRt rt
+              , Row.Lacks l tailRt
+              ) =>
   Wire (Cons l (View spec v) t) all ctx hosts rt where
   wire _ all ctx hosts = do
     handle <- newView (Record.get (Proxy :: Proxy l) ctx) (Record.get (Proxy :: Proxy source) hosts)
     rest <- wire (Proxy :: Proxy t) all ctx hosts
     pure (Builder.insert (Proxy :: Proxy l) handle <<< rest)
-
-else instance
-  ( IsSymbol l
-  , Spec src sid ss sc se sr sb
-  , Spec tgt tid ts tc te tr tb
-  , FindAggregate src all source
-  , FindAggregate tgt all target
-  , IsSymbol source
-  , IsSymbol target
-  , Row.Cons source (Host src sid sb) sourceTail hosts
-  , Row.Cons target (Host tgt tid tb) targetTail hosts
-  , Row.Cons l (Policy src tgt) ctxTail ctx
-  , Wire t all ctx hosts rt
-  ) =>
+else instance ( IsSymbol l
+              , Spec src sid ss sc se sr sb
+              , Spec tgt tid ts tc te tr tb
+              , FindAggregate src all source
+              , FindAggregate tgt all target
+              , IsSymbol source
+              , IsSymbol target
+              , Row.Cons source (Host src sid sb) sourceTail hosts
+              , Row.Cons target (Host tgt tid tb) targetTail hosts
+              , Row.Cons l (Policy src tgt) ctxTail ctx
+              , Wire t all ctx hosts rt
+              ) =>
   Wire (Cons l (Policy src tgt) t) all ctx hosts rt where
   wire _ all ctx hosts = do
     wirePolicy (reflectSymbol (Proxy :: Proxy l)) (Record.get (Proxy :: Proxy l) ctx)
-      (Record.get (Proxy :: Proxy source) hosts)
-      (Record.get (Proxy :: Proxy target) hosts)
+      (Record.get (Proxy :: Proxy source) hosts) (Record.get (Proxy :: Proxy target) hosts)
     wire (Proxy :: Proxy t) all ctx hosts
-
-else instance
-  Fail
-    ( Beside (Text "a context entry must be an Aggregate, a View, or a Policy, but ")
-        (Beside (QuoteLabel l) (Beside (Text " is ") (Quote entry)))
-    ) =>
+else instance Fail
+  ( Beside
+      (Text "a context entry must be an Aggregate, a View, or a Policy, but ")
+      (Beside (QuoteLabel l) (Beside (Text " is ") (Quote entry)))
+  ) =>
   Wire (Cons l entry t) all ctx hosts rt where
   wire _ _ _ _ = unsafeCrashWith "unreachable: rejected at compile time"
 
@@ -526,9 +508,7 @@ class FindAggregate spec rl l | spec rl -> l
 
 instance FindAggregate spec (Cons l (Aggregate spec) t) l
 else instance FindAggregate spec t l => FindAggregate spec (Cons m entry t) l
-else instance
-  Fail
-    ( Above (Text "a view or policy reads an aggregate this context does not contain:")
-        (Quote spec)
-    ) =>
+else instance Fail
+  ( Above (Text "a view or policy reads an aggregate this context does not contain:") (Quote spec)
+  ) =>
   FindAggregate spec Nil l

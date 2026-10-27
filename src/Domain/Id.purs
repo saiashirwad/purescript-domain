@@ -17,7 +17,8 @@ module Domain.Id
   , advance
   , sequencesAfter
   , derivedCommandId
-  ) where
+  )
+  where
 
 import Prelude
 

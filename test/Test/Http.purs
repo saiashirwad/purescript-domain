@@ -45,8 +45,7 @@ testHttp = do
   overdraw <- post sam "/account/a-1/withdrawMoney" "k-withdraw" (encodeJson { amount: 5 })
   assertEqual "a rejection is a 409" 409 overdraw.status
   assertJson "the rejection body carries the label and payload"
-    """{"type":"insufficientFunds","value":{"balance":0,"requested":5}}"""
-    overdraw.body
+    """{"type":"insufficientFunds","value":{"balance":0,"requested":5}}""" overdraw.body
 
   deposited <- post sam "/account/a-1/depositMoney" "k-deposit" (encodeJson { amount: 70 })
   assertEqual "a deposit commits" 200 deposited.status
@@ -56,9 +55,7 @@ testHttp = do
   atLeast <- get sam "/summary/a-1" [ Tuple "atLeast" "2" ]
   assertEqual "atLeast waits for a version already reached" 200 atLeast.status
   statement <- get sam "/statement/a-1" []
-  assertJson "another view route"
-    """[{"kind":"deposit","amount":70,"balance":70}]"""
-    statement.body
+  assertJson "another view route" """[{"kind":"deposit","amount":70,"balance":70}]""" statement.body
   missing <- get sam "/summary/a-1" [ Tuple "atLeast" "x" ]
   assertEqual "a malformed atLeast is 400" 400 missing.status
 

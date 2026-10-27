@@ -10,7 +10,8 @@ module Domain.Labels
   , class Has
   , class Covers
   , class HasLabel
-  ) where
+  )
+  where
 
 import Data.Variant (Variant)
 import Prim.RowList (Cons, Nil, RowList)
@@ -44,8 +45,7 @@ class IsVariant :: Symbol -> Type -> Row Type -> Constraint
 class IsVariant what t row | t -> row
 
 instance IsVariant what (Variant row) row
-else instance
-  Fail (Beside (Text what) (Beside (Text " must be a Variant, not ") (Quote t))) =>
+else instance Fail (Beside (Text what) (Beside (Text " must be a Variant, not ") (Quote t))) =>
   IsVariant what t row
 
 -- | Every label of `small` appears in `big` with the same payload type.
@@ -59,12 +59,14 @@ class Has :: Symbol -> Symbol -> Type -> RowList Type -> Constraint
 class Has what l a rl
 
 instance Has what l a (Cons l a t)
-else instance
-  Fail
-    ( Above
-        (Beside (Text "the payload of ") (QuoteLabel l))
-        (Beside (Text "is ") (Beside (Quote a) (Beside (Text " here but ") (Beside (Quote b) (Text " in the spec")))))
-    ) =>
+else instance Fail
+  ( Above
+      (Beside (Text "the payload of ") (QuoteLabel l))
+      ( Beside
+          (Text "is ")
+          (Beside (Quote a) (Beside (Text " here but ") (Beside (Quote b) (Text " in the spec"))))
+      )
+  ) =>
   Has what l a (Cons l b t)
 else instance Has what l a t => Has what l a (Cons m x t)
 else instance Fail (Beside (Text what) (QuoteLabel l)) => Has what l a Nil

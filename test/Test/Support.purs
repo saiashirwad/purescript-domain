@@ -9,7 +9,8 @@ module Test.Support
   , testOptions
   , recordingOptions
   , fail
-  ) where
+  )
+  where
 
 import Prelude
 
@@ -32,9 +33,8 @@ fail :: forall a. String -> Aff a
 fail message = throwError (error ("FAIL " <> message))
 
 assertEqual :: forall a. Eq a => Show a => String -> a -> a -> Aff Unit
-assertEqual label expected actual =
-  unless (expected == actual) do
-    fail (label <> "\n  expected: " <> show expected <> "\n  actual:   " <> show actual)
+assertEqual label expected actual = unless (expected == actual) do
+  fail (label <> "\n  expected: " <> show expected <> "\n  actual:   " <> show actual)
 
 assertThat :: String -> Boolean -> Aff Unit
 assertThat label ok = unless ok (fail label)

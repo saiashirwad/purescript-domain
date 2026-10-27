@@ -1,12 +1,7 @@
 -- | A keyed serial executor: work for one key runs one job at a time in
 -- | arrival order, and different keys run concurrently. Each key has a
 -- | bounded mailbox, so a fast producer waits instead of growing memory.
-module Domain.Runtime.Serial
-  ( Serial
-  , new
-  , run
-  , close
-  ) where
+module Domain.Runtime.Serial (Serial, new, run, close) where
 
 import Prelude
 
@@ -28,11 +23,8 @@ import Effect.Exception (error)
 import Effect.Ref (Ref)
 import Effect.Ref as Ref
 
-newtype Serial = Serial
-  { capacity :: Int
-  , workers :: Ref (Map String Worker)
-  , closed :: Ref Boolean
-  }
+newtype Serial =
+  Serial { capacity :: Int, workers :: Ref (Map String Worker), closed :: Ref Boolean }
 
 type Worker = { mailbox :: Mailbox, fiber :: Fiber Unit }
 
@@ -53,7 +45,8 @@ run serial@(Serial state) key job = do
   -- this job queued or this caller observes the close.
   accepted <- liftEffect do
     closed <- Ref.read state.closed
-    if closed then unreserve worker.mailbox $> false
+    if closed
+    then unreserve worker.mailbox $> false
     else post worker.mailbox (attempt job >>= \outcome -> AVar.put outcome result) $> true
   unless accepted (throwError (error ("Domain.Runtime: " <> key <> " is shut down")))
   AVar.take result >>= either throwError pure
@@ -79,7 +72,8 @@ workerFor serial@(Serial state) key = do
       Nothing -> do
         mailbox <- mkMailbox state.capacity
         fiber <- launchAff (loop serial mailbox)
-        let worker = { mailbox, fiber }
+        let
+          worker = { mailbox, fiber }
         Ref.modify_ (Map.insert key worker) state.workers
         pure worker
 
@@ -94,11 +88,8 @@ loop serial@(Serial state) mailbox = do
 
 -- | A bounded FIFO. Posting and waking share one effect so a queued job is
 -- | never left without a wake token; claiming a job frees its slot.
-newtype Mailbox = Mailbox
-  { pending :: Ref (CatQueue (Aff Unit))
-  , ready :: AVar Unit
-  , slots :: Semaphore
-  }
+newtype Mailbox =
+  Mailbox { pending :: Ref (CatQueue (Aff Unit)), ready :: AVar Unit, slots :: Semaphore }
 
 mkMailbox :: Int -> Effect Mailbox
 mkMailbox capacity = do

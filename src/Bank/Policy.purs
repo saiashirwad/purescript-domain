@@ -1,7 +1,4 @@
-module Bank.Policy
-  ( provisioning
-  , mainAccount
-  ) where
+module Bank.Policy (provisioning, mainAccount) where
 
 import Prelude
 

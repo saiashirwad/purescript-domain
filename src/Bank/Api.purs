@@ -1,9 +1,6 @@
 -- | Who may touch what. Routes, codecs, and status codes come from
 -- | `Domain.Http.serve bank guards`.
-module Bank.Api
-  ( Principal
-  , guards
-  ) where
+module Bank.Api (Principal, guards) where
 
 import Prelude
 
@@ -12,20 +9,16 @@ import Bank.Customer (CustomerId)
 import Data.Set (Set)
 import Data.Set as Set
 
-type Principal =
-  { subject :: String
-  , roles :: Set String
-  , accounts :: Set AccountId
-  }
+type Principal = { subject :: String, roles :: Set String, accounts :: Set AccountId }
 
 type Guard id = Principal -> id -> Boolean
 
-guards
-  :: { account :: Guard AccountId
-     , customer :: Guard CustomerId
-     , summary :: Guard AccountId
-     , statement :: Guard AccountId
-     }
+guards ::
+  { account :: Guard AccountId
+  , customer :: Guard CustomerId
+  , summary :: Guard AccountId
+  , statement :: Guard AccountId
+  }
 guards =
   { account: ownsAccount
   , customer: \principal _ -> isAdmin principal

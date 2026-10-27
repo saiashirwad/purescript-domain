@@ -53,7 +53,8 @@ module Domain
   , class Table
   , table
   , module Domain.Id
-  ) where
+  )
+  where
 
 import Prelude
 
@@ -95,18 +96,17 @@ import Unsafe.Coerce (unsafeCoerce)
 class Spec :: Type -> Type -> Type -> Row Type -> Row Type -> Row Type -> Type -> Constraint
 class Spec spec id s c e r b | spec -> id s c e r b
 
-instance
-  ( RowToList spec fields
-  , Field "an aggregate spec needs the field " "id" fields id
-  , Field "an aggregate spec needs the field " "state" fields s
-  , Field "an aggregate spec needs the field " "command" fields command
-  , Field "an aggregate spec needs the field " "event" fields event
-  , Field "an aggregate spec needs the field " "rejection" fields rejection
-  , Field "an aggregate spec needs the field " "reply" fields b
-  , IsVariant "the spec's command field" command c
-  , IsVariant "the spec's event field" event e
-  , IsVariant "the spec's rejection field" rejection r
-  ) =>
+instance ( RowToList spec fields
+         , Field "an aggregate spec needs the field " "id" fields id
+         , Field "an aggregate spec needs the field " "state" fields s
+         , Field "an aggregate spec needs the field " "command" fields command
+         , Field "an aggregate spec needs the field " "event" fields event
+         , Field "an aggregate spec needs the field " "rejection" fields rejection
+         , Field "an aggregate spec needs the field " "reply" fields b
+         , IsVariant "the spec's command field" command c
+         , IsVariant "the spec's event field" event e
+         , IsVariant "the spec's rejection field" rejection r
+         ) =>
   Spec (Record spec) id s c e r b
 
 -- | Stands in for a type the spec determines.
@@ -136,34 +136,34 @@ untagged v = case (unsafeCoerce v :: VariantRep Erased) of
 
 -- | `cmd @"depositMoney" { amount: 100 }`. The spec comes from the use
 -- | site, so no label needs a hand-written constructor.
-cmd
-  :: forall @l spec id s c e r b a crl
-   . Spec spec id s c e r b
-  => RowToList c crl
-  => Field "the aggregate declares no command " l crl a
-  => IsSymbol l
-  => a
-  -> Command spec
+cmd ::
+  forall @l spec id s c e r b a crl.
+  Spec spec id s c e r b =>
+  RowToList c crl =>
+  Field "the aggregate declares no command " l crl a =>
+  IsSymbol l =>
+  a ->
+  Command spec
 cmd = Command <<< tagged (reflectSymbol (Proxy :: Proxy l))
 
-event
-  :: forall @l spec id s c e r b a erl
-   . Spec spec id s c e r b
-  => RowToList e erl
-  => Field "the aggregate declares no event " l erl a
-  => IsSymbol l
-  => a
-  -> Event spec
+event ::
+  forall @l spec id s c e r b a erl.
+  Spec spec id s c e r b =>
+  RowToList e erl =>
+  Field "the aggregate declares no event " l erl a =>
+  IsSymbol l =>
+  a ->
+  Event spec
 event = Event <<< tagged (reflectSymbol (Proxy :: Proxy l))
 
-rejection
-  :: forall @l spec id s c e r b a rrl
-   . Spec spec id s c e r b
-  => RowToList r rrl
-  => Field "the aggregate declares no rejection " l rrl a
-  => IsSymbol l
-  => a
-  -> Rejection spec
+rejection ::
+  forall @l spec id s c e r b a rrl.
+  Spec spec id s c e r b =>
+  RowToList r rrl =>
+  Field "the aggregate declares no rejection " l rrl a =>
+  IsSymbol l =>
+  a ->
+  Rejection spec
 rejection = Rejection <<< tagged (reflectSymbol (Proxy :: Proxy l))
 
 -- | Commands, events, and rejections are variants of their spec's rows.
@@ -197,13 +197,16 @@ instance (Spec spec id s c e r b, Eq (Variant e)) => Eq (Event spec) where
 instance (Spec spec id s c e r b, Eq (Variant r)) => Eq (Rejection spec) where
   eq x y = toVariant x == toVariant y
 
-instance (Spec spec id s c e r b, RowToList c rl, VariantTags rl, VariantShows rl) => Show (Command spec) where
+instance (Spec spec id s c e r b, RowToList c rl, VariantTags rl, VariantShows rl) =>
+  Show (Command spec) where
   show = show <<< toVariant
 
-instance (Spec spec id s c e r b, RowToList e rl, VariantTags rl, VariantShows rl) => Show (Event spec) where
+instance (Spec spec id s c e r b, RowToList e rl, VariantTags rl, VariantShows rl) =>
+  Show (Event spec) where
   show = show <<< toVariant
 
-instance (Spec spec id s c e r b, RowToList r rl, VariantTags rl, VariantShows rl) => Show (Rejection spec) where
+instance (Spec spec id s c e r b, RowToList r rl, VariantTags rl, VariantShows rl) =>
+  Show (Rejection spec) where
   show = show <<< toVariant
 
 -- | What one handler decides. Each handler names the narrow rows it may
@@ -212,22 +215,22 @@ instance (Spec spec id s c e r b, RowToList r rl, VariantTags rl, VariantShows r
 type Decision r e = Either (Variant r) (Array (Variant e))
 
 -- | Record one event. Combine with `<>` to record several.
-emit
-  :: forall @l a e erl r
-   . RowToList e erl
-  => Field "the handler's event row does not include " l erl a
-  => IsSymbol l
-  => a
-  -> Decision r e
+emit ::
+  forall @l a e erl r.
+  RowToList e erl =>
+  Field "the handler's event row does not include " l erl a =>
+  IsSymbol l =>
+  a ->
+  Decision r e
 emit payload = Right [ unsafeCoerce (tagged (reflectSymbol (Proxy :: Proxy l)) payload) ]
 
-reject
-  :: forall @l a r rrl e
-   . RowToList r rrl
-  => Field "the handler's rejection row does not include " l rrl a
-  => IsSymbol l
-  => a
-  -> Decision r e
+reject ::
+  forall @l a r rrl e.
+  RowToList r rrl =>
+  Field "the handler's rejection row does not include " l rrl a =>
+  IsSymbol l =>
+  a ->
+  Decision r e
 reject payload = Left (unsafeCoerce (tagged (reflectSymbol (Proxy :: Proxy l)) payload))
 
 -- | A pure decider in spec terms. `evolve` is total: events are facts.
@@ -245,27 +248,24 @@ type role Aggregate nominal
 
 -- | Build an aggregate from handler records keyed by label. `decide` and
 -- | `evolve` must cover the spec's rows exactly.
-aggregate
-  :: forall spec id s c e r b dh eh crl erl drl ehl
-   . Spec spec id s c e r b
-  => RowToList c crl
-  => RowToList e erl
-  => RowToList dh drl
-  => RowToList eh ehl
-  => Covers "decide is missing a handler for the command " crl drl
-  => Covers "evolve is missing a handler for the event " erl ehl
-  => DecideTable drl dh s spec
-  => Table "evolve handles an undeclared event " ehl eh erl s s
-  => { initial :: s
-     , decide :: Record dh
-     , evolve :: Record eh
-     , reply :: s -> b
-     }
-  -> Aggregate spec
+aggregate ::
+  forall spec id s c e r b dh eh crl erl drl ehl.
+  Spec spec id s c e r b =>
+  RowToList c crl =>
+  RowToList e erl =>
+  RowToList dh drl =>
+  RowToList eh ehl =>
+  Covers "decide is missing a handler for the command " crl drl =>
+  Covers "evolve is missing a handler for the event " erl ehl =>
+  DecideTable drl dh s spec =>
+  Table "evolve handles an undeclared event " ehl eh erl s s =>
+  { initial :: s, decide :: Record dh, evolve :: Record eh, reply :: s -> b } ->
+  Aggregate spec
 aggregate definition = Aggregate (unsafeCoerce typed)
   where
   decisions = decideTable (Proxy :: Proxy drl) definition.decide
-  facts = table (Proxy :: Proxy "evolve handles an undeclared event ") (Proxy :: Proxy erl) (Proxy :: Proxy ehl) definition.evolve
+  facts = table (Proxy :: Proxy "evolve handles an undeclared event ") (Proxy :: Proxy erl)
+    (Proxy :: Proxy ehl) definition.evolve
 
   typed :: Decider spec s b
   typed =
@@ -279,27 +279,24 @@ decider :: forall spec id s c e r b. Spec spec id s c e r b => Aggregate spec ->
 decider (Aggregate erased) = unsafeCoerce erased
 
 -- | Decide, then fold the new events into the state.
-commit
-  :: forall spec id s c e r b
-   . Spec spec id s c e r b
-  => Aggregate spec
-  -> s
-  -> Command spec
-  -> Either (Rejection spec) { state :: s, events :: Array (Event spec), reply :: b }
+commit ::
+  forall spec id s c e r b.
+  Spec spec id s c e r b =>
+  Aggregate spec ->
+  s ->
+  Command spec ->
+  Either (Rejection spec) { state :: s, events :: Array (Event spec), reply :: b }
 commit aggregate' state command = do
-  let d = decider aggregate'
+  let
+    d = decider aggregate'
   events <- d.decide state command
-  let next = foldl d.evolve state events
+  let
+    next = foldl d.evolve state events
   pure { state: next, events, reply: d.reply next }
 
 -- | Replay is a fold, so `replay a s (xs <> ys) == replay a (replay a s xs) ys`.
-replay
-  :: forall spec id s c e r b
-   . Spec spec id s c e r b
-  => Aggregate spec
-  -> s
-  -> Array (Event spec)
-  -> s
+replay ::
+  forall spec id s c e r b. Spec spec id s c e r b => Aggregate spec -> s -> Array (Event spec) -> s
 replay aggregate' = foldl (decider aggregate').evolve
 
 -- | A read model over one aggregate's events, kept per entity id. Handlers
@@ -309,20 +306,19 @@ newtype View spec v = View { initial :: v, step :: v -> Event spec -> v }
 
 type role View nominal representational
 
-view
-  :: forall spec id s c e r b v hs hrl erl
-   . Spec spec id s c e r b
-  => RowToList hs hrl
-  => RowToList e erl
-  => Table "a view handles an undeclared event " hrl hs erl v v
-  => { initial :: v, on :: Record hs }
-  -> View spec v
-view definition = View
-  { initial: definition.initial
-  , step: \state (Event v) -> dispatch handlers identity state v
-  }
+view ::
+  forall spec id s c e r b v hs hrl erl.
+  Spec spec id s c e r b =>
+  RowToList hs hrl =>
+  RowToList e erl =>
+  Table "a view handles an undeclared event " hrl hs erl v v =>
+  { initial :: v, on :: Record hs } ->
+  View spec v
+view definition =
+  View { initial: definition.initial, step: \state (Event v) -> dispatch handlers identity state v }
   where
-  handlers = table (Proxy :: Proxy "a view handles an undeclared event ") (Proxy :: Proxy erl) (Proxy :: Proxy hrl) definition.on
+  handlers = table (Proxy :: Proxy "a view handles an undeclared event ") (Proxy :: Proxy erl)
+    (Proxy :: Proxy hrl) definition.on
 
 runView :: forall spec v. View spec v -> { initial :: v, step :: v -> Event spec -> v }
 runView (View fold) = fold
@@ -339,47 +335,51 @@ newtype Order tgt = Order { to :: Erased, command :: Command tgt }
 
 type role Order nominal
 
-policy
-  :: forall src id s c e r b tgt hs hrl erl
-   . Spec src id s c e r b
-  => RowToList hs hrl
-  => RowToList e erl
-  => Table "a policy reacts to an undeclared event " hrl hs erl id (Array (Order tgt))
-  => Record hs
-  -> Policy src tgt
+policy ::
+  forall src id s c e r b tgt hs hrl erl.
+  Spec src id s c e r b =>
+  RowToList hs hrl =>
+  RowToList e erl =>
+  Table "a policy reacts to an undeclared event " hrl hs erl id (Array (Order tgt)) =>
+  Record hs ->
+  Policy src tgt
 policy handlers = Policy (unsafeCoerce typed)
   where
   typed :: Object (id -> Erased -> Array (Order tgt))
-  typed = table (Proxy :: Proxy "a policy reacts to an undeclared event ") (Proxy :: Proxy erl) (Proxy :: Proxy hrl) handlers
+  typed = table (Proxy :: Proxy "a policy reacts to an undeclared event ") (Proxy :: Proxy erl)
+    (Proxy :: Proxy hrl) handlers
 
 -- | `order @"openAccount" accountId { owner }`.
-order
-  :: forall @l tgt id s c e r b a crl
-   . Spec tgt id s c e r b
-  => RowToList c crl
-  => Field "the target aggregate declares no command " l crl a
-  => IsSymbol l
-  => id
-  -> a
-  -> Order tgt
-order to payload =
-  Order { to: unsafeCoerce to, command: Command (tagged (reflectSymbol (Proxy :: Proxy l)) payload) }
+order ::
+  forall @l tgt id s c e r b a crl.
+  Spec tgt id s c e r b =>
+  RowToList c crl =>
+  Field "the target aggregate declares no command " l crl a =>
+  IsSymbol l =>
+  id ->
+  a ->
+  Order tgt
+order to payload = Order
+  { to: unsafeCoerce to, command: Command (tagged (reflectSymbol (Proxy :: Proxy l)) payload) }
 
 -- | An order with its command id derived from the event that caused it.
 type Addressed id spec = { commandId :: CommandId, to :: id, command :: Command spec }
 
 -- | The orders a policy, known by `name`, places for one event.
-orders
-  :: forall src sid ss sc se sr sb tgt tid ts tc te tr tb
-   . Spec src sid ss sc se sr sb
-  => Spec tgt tid ts tc te tr tb
-  => String
-  -> Policy src tgt
-  -> Envelope sid (Event src)
-  -> Array (Addressed tid tgt)
-orders name (Policy handlers) envelope =
-  mapWithIndex address
-    (dispatch handlers (\_ -> []) (unsafeCoerce envelope.id) (case envelope.event of Event v -> v))
+orders ::
+  forall src sid ss sc se sr sb tgt tid ts tc te tr tb.
+  Spec src sid ss sc se sr sb =>
+  Spec tgt tid ts tc te tr tb =>
+  String ->
+  Policy src tgt ->
+  Envelope sid (Event src) ->
+  Array (Addressed tid tgt)
+orders name (Policy handlers) envelope = mapWithIndex address
+  ( dispatch handlers (\_ -> []) (unsafeCoerce envelope.id)
+      ( case envelope.event of
+          Event v -> v
+      )
+  )
   where
   address index (Order placed) =
     { commandId: derivedCommandId name envelope.stream envelope.seq index
@@ -399,52 +399,44 @@ type Envelope id ev =
 
 -- | What a committed command returns. Retrying the command id returns the
 -- | same receipt.
-type Receipt ev b =
-  { commandId :: CommandId
-  , version :: Version
-  , events :: Array ev
-  , reply :: b
-  }
+type Receipt ev b = { commandId :: CommandId, version :: Version, events :: Array ev, reply :: b }
 
 dispatch :: forall x out. Object (x -> Erased -> out) -> (x -> out) -> x -> Variant () -> out
 dispatch handlers fallback x v =
-  let { type: tag, value } = untagged v
-  in maybe (fallback x) (\handler -> handler x value) (Object.lookup tag handlers)
+  let
+    { type: tag, value } = untagged v
+  in
+    maybe (fallback x) (\handler -> handler x value) (Object.lookup tag handlers)
 
 -- | Builds the `decide` dispatch table. Each handler's payload comes from
 -- | the spec, and its narrow rows must be sub-rows of the spec's.
 class DecideTable :: RowList Type -> Row Type -> Type -> Type -> Constraint
 class DecideTable rl hs s spec where
-  decideTable
-    :: Proxy rl
-    -> Record hs
-    -> Object (s -> Erased -> Either (Rejection spec) (Array (Event spec)))
+  decideTable ::
+    Proxy rl -> Record hs -> Object (s -> Erased -> Either (Rejection spec) (Array (Event spec)))
 
 instance DecideTable Nil hs s spec where
   decideTable _ _ = Object.empty
 
-instance
-  ( IsSymbol l
-  , Spec spec id s c e r b
-  , RowToList c crl
-  , RowToList e erl
-  , RowToList r rrl
-  , Field "decide handles an undeclared command " l crl a
-  , Row.Cons l (s -> a -> Decision ri ei) hsTail hs
-  , RowToList ri rirl
-  , RowToList ei eirl
-  , SubRow "a decide handler rejects with an undeclared rejection " rirl rrl
-  , SubRow "a decide handler emits an undeclared event " eirl erl
-  , DecideTable t hs s spec
-  ) =>
+instance ( IsSymbol l
+         , Spec spec id s c e r b
+         , RowToList c crl
+         , RowToList e erl
+         , RowToList r rrl
+         , Field "decide handles an undeclared command " l crl a
+         , Row.Cons l (s -> a -> Decision ri ei) hsTail hs
+         , RowToList ri rirl
+         , RowToList ei eirl
+         , SubRow "a decide handler rejects with an undeclared rejection " rirl rrl
+         , SubRow "a decide handler emits an undeclared event " eirl erl
+         , DecideTable t hs s spec
+         ) =>
   DecideTable (Cons l h t) hs s spec where
   decideTable _ handlers =
-    Object.insert (reflectSymbol (Proxy :: Proxy l)) run
-      (decideTable (Proxy :: Proxy t) handlers)
+    Object.insert (reflectSymbol (Proxy :: Proxy l)) run (decideTable (Proxy :: Proxy t) handlers)
     where
-    run state payload =
-      bimap (Rejection <<< unsafeCoerce) (map (Event <<< unsafeCoerce))
-        (Record.get (Proxy :: Proxy l) handlers state (unsafeCoerce payload))
+    run state payload = bimap (Rejection <<< unsafeCoerce) (map (Event <<< unsafeCoerce))
+      (Record.get (Proxy :: Proxy l) handlers state (unsafeCoerce payload))
 
 -- | Builds a dispatch table for handlers of shape `x -> payload -> out`,
 -- | where each payload type comes from `labels`.
@@ -455,14 +447,12 @@ class Table what rl hs labels x out where
 instance Table what Nil hs labels x out where
   table _ _ _ _ = Object.empty
 
-instance
-  ( IsSymbol l
-  , Field what l labels a
-  , Row.Cons l (x -> a -> out) hsTail hs
-  , Table what t hs labels x out
-  ) =>
+instance ( IsSymbol l
+         , Field what l labels a
+         , Row.Cons l (x -> a -> out) hsTail hs
+         , Table what t hs labels x out
+         ) =>
   Table what (Cons l h t) hs labels x out where
-  table what labels _ handlers =
-    Object.insert (reflectSymbol (Proxy :: Proxy l))
-      (\x payload -> Record.get (Proxy :: Proxy l) handlers x (unsafeCoerce payload))
-      (table what labels (Proxy :: Proxy t) handlers)
+  table what labels _ handlers = Object.insert (reflectSymbol (Proxy :: Proxy l))
+    (\x payload -> Record.get (Proxy :: Proxy l) handlers x (unsafeCoerce payload))
+    (table what labels (Proxy :: Proxy t) handlers)

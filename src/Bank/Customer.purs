@@ -1,9 +1,4 @@
-module Bank.Customer
-  ( CustomerId(..)
-  , CustomerState(..)
-  , Customer
-  , customer
-  ) where
+module Bank.Customer (CustomerId(..), CustomerState(..), Customer, customer) where
 
 import Prelude
 
@@ -20,9 +15,7 @@ derive newtype instance Eq CustomerId
 derive newtype instance Ord CustomerId
 derive newtype instance Show CustomerId
 
-data CustomerState
-  = Unregistered
-  | Registered { name :: String }
+data CustomerState = Unregistered | Registered { name :: String }
 
 derive instance Eq CustomerState
 derive instance Generic CustomerState _
@@ -46,9 +39,9 @@ customer = aggregate
   , reply: \_ -> unit
   }
 
-registerCustomer
-  :: CustomerState
-  -> { name :: String }
-  -> Decision (alreadyRegistered :: {}) (customerRegistered :: { name :: String })
+registerCustomer ::
+  CustomerState ->
+  { name :: String } ->
+  Decision (alreadyRegistered :: {}) (customerRegistered :: { name :: String })
 registerCustomer Unregistered { name } = emit @"customerRegistered" { name }
 registerCustomer (Registered _) _ = reject @"alreadyRegistered" {}

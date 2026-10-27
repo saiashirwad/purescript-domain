@@ -1,9 +1,4 @@
-module Bank.Views
-  ( Summary
-  , StatementLine
-  , summary
-  , statement
-  ) where
+module Bank.Views (Summary, StatementLine, summary, statement) where
 
 import Prelude
 

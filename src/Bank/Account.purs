@@ -1,10 +1,4 @@
-module Bank.Account
-  ( AccountId(..)
-  , AccountState(..)
-  , Account
-  , Movement
-  , account
-  ) where
+module Bank.Account (AccountId(..), AccountState(..), Account, Movement, account) where
 
 import Prelude
 
@@ -21,9 +15,7 @@ derive newtype instance Eq AccountId
 derive newtype instance Ord AccountId
 derive newtype instance Show AccountId
 
-data AccountState
-  = Unopened
-  | Open { owner :: String, balance :: Int }
+data AccountState = Unopened | Open { owner :: String, balance :: Int }
 
 derive instance Eq AccountState
 derive instance Generic AccountState _
@@ -39,21 +31,19 @@ type Shortfall = { balance :: Int, requested :: Int }
 type Account =
   { id :: AccountId
   , state :: AccountState
-  , command :: Variant
-      ( openAccount :: { owner :: String }
-      , depositMoney :: { amount :: Int }
-      , withdrawMoney :: { amount :: Int }
-      )
-  , event :: Variant
-      ( accountOpened :: { owner :: String }
-      , moneyDeposited :: Movement
-      , moneyWithdrawn :: Movement
-      )
-  , rejection :: Variant
-      ( alreadyOpen :: {}
-      , notOpen :: {}
-      , insufficientFunds :: Shortfall
-      )
+  , command ::
+      Variant
+        ( openAccount :: { owner :: String }
+        , depositMoney :: { amount :: Int }
+        , withdrawMoney :: { amount :: Int }
+        )
+  , event ::
+      Variant
+        ( accountOpened :: { owner :: String }
+        , moneyDeposited :: Movement
+        , moneyWithdrawn :: Movement
+        )
+  , rejection :: Variant (alreadyOpen :: {}, notOpen :: {}, insufficientFunds :: Shortfall)
   , reply :: { balance :: Int }
   }
 
@@ -69,25 +59,23 @@ account = aggregate
   , reply: \state -> { balance: balanceOf state }
   }
 
-openAccount
-  :: AccountState
-  -> { owner :: String }
-  -> Decision (alreadyOpen :: {}) (accountOpened :: { owner :: String })
+openAccount ::
+  AccountState ->
+  { owner :: String } ->
+  Decision (alreadyOpen :: {}) (accountOpened :: { owner :: String })
 openAccount Unopened { owner } = emit @"accountOpened" { owner }
 openAccount (Open _) _ = reject @"alreadyOpen" {}
 
-depositMoney
-  :: AccountState
-  -> { amount :: Int }
-  -> Decision (notOpen :: {}) (moneyDeposited :: Movement)
+depositMoney ::
+  AccountState -> { amount :: Int } -> Decision (notOpen :: {}) (moneyDeposited :: Movement)
 depositMoney Unopened _ = reject @"notOpen" {}
 depositMoney (Open { balance }) { amount } =
   emit @"moneyDeposited" { amount, balanceAfter: balance + amount }
 
-withdrawMoney
-  :: AccountState
-  -> { amount :: Int }
-  -> Decision (notOpen :: {}, insufficientFunds :: Shortfall) (moneyWithdrawn :: Movement)
+withdrawMoney ::
+  AccountState ->
+  { amount :: Int } ->
+  Decision (notOpen :: {}, insufficientFunds :: Shortfall) (moneyWithdrawn :: Movement)
 withdrawMoney Unopened _ = reject @"notOpen" {}
 withdrawMoney (Open { balance }) { amount }
   | amount > balance = reject @"insufficientFunds" { balance, requested: amount }
