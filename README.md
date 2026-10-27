@@ -58,7 +58,8 @@ decide is missing a handler for the command withdrawMoney
 ## Layout
 
 - `src/Domain.purs` is the pure kernel: specs, labelled values, aggregates, views, and policies.
-- `src/Domain/Runtime.purs` runs a context. `src/Domain/Runtime/Serial.purs` is the per-stream executor it uses.
+- `src/Domain/Stream.purs` is what one command does to one stream, as a pure function.
+- `src/Domain/Runtime.purs` runs a context: it serializes each stream's turns, keeps the streams, and applies views and policies.
 - `src/Domain/Story.purs` runs given/when/then stories.
 - `src/Domain/Codec.purs` and `src/Domain/Http.purs` derive the wire format and the HTTP boundary.
 - `src/Domain/Labels.purs` holds the label checks behind the compile errors.

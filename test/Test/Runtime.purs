@@ -24,6 +24,7 @@ testRuntime = do
   dashboard
   dashboardUnderConcurrency
   policy
+  commandIdsPerStream
 
 exactlyOnce :: Aff Unit
 exactlyOnce = do
@@ -225,4 +226,22 @@ policy = do
     (Left (rejection @"alreadyRegistered" {})) (map _.events again)
   stillOne <- rt.account.history (mainAccount ada)
   assertEqual "a refused trigger opens nothing" 1 (length stillOne)
+  rt.stop
+
+-- | A command id names one command to one stream, so reusing it on another
+-- | account is a new command, not a retry.
+commandIdsPerStream :: Aff Unit
+commandIdsPerStream = do
+  rt <- start bank testOptions
+  let
+    checking = AccountId "a-1"
+    savings = AccountId "a-2"
+    open id = rt.account.send (commandId "open") id (cmd @"openAccount" { owner: CustomerId "sam" })
+  _ <- expectRight "open checking" =<< open checking
+  _ <- expectRight "open savings" =<< open savings
+  histories <- for [ checking, savings ] rt.account.history
+  assertEqual "the same command id commits on both accounts" [ 1, 1 ] (map length histories)
+  summary <- rt.summary.read savings
+  assertEqual "the second account is open" (Just { owner: Just (CustomerId "sam"), balance: 0 })
+    summary
   rt.stop

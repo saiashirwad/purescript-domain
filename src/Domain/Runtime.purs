@@ -31,12 +31,12 @@ module Domain.Runtime
 
 import Prelude
 
-import Data.Array (concatMap, intercalate, length, scanl, zipWith)
+import Data.Array (concatMap, intercalate, length)
 import Data.Array as Array
 import Data.CatQueue (CatQueue)
 import Data.CatQueue as CatQueue
 import Data.DateTime.Instant (Instant, diff)
-import Data.Either (Either(..))
+import Data.Either (Either(..), either)
 import Data.Foldable (foldl, for_, sum)
 import Data.JSDate as JSDate
 import Data.Map (Map)
@@ -57,30 +57,16 @@ import Domain
   , Receipt
   , Rejection
   , View
-  , commit
-  , decider
   , orders
   , runView
   , tagOf
   )
-import Domain.Id
-  ( CommandId
-  , StreamId
-  , Version
-  , advance
-  , commandIdText
-  , sequencesAfter
-  , streamIdText
-  , streamOf
-  , versionNumber
-  , zeroVersion
-  )
-import Domain.Runtime.Serial (Serial)
-import Domain.Runtime.Serial as Serial
+import Domain.Id (CommandId, StreamId, commandIdText, streamIdText, streamOf, versionNumber)
+import Domain.Stream (Fact, Stream, Turn(..), open, turn)
 import Effect (Effect)
 import Effect.AVar (AVar)
 import Effect.AVar as EffectAVar
-import Effect.Aff (Aff, finally, throwError)
+import Effect.Aff (Aff, Fiber, attempt, finally, joinFiber, launchAff, throwError)
 import Effect.Aff.AVar as AVar
 import Effect.Class (liftEffect)
 import Effect.Exception (error)
@@ -160,7 +146,7 @@ type System =
 
 newSystem :: Options -> Effect System
 newSystem options = do
-  serial <- Serial.new options.capacity
+  serial <- newSerial options.capacity
   closed <- Ref.new false
   inFlight <- Ref.new 0
   idle <- EffectAVar.empty
@@ -189,9 +175,9 @@ stopSystem system = do
     Ref.write true system.closed
     (_ > 0) <$> Ref.read system.inFlight
   when busy (AVar.read system.idle)
-  Serial.close system.serial
+  closeSerial system.serial
 
--- | One aggregate's store and subscribers. `handle` is what callers get;
+-- | One aggregate's streams and subscribers. `handle` is what callers get;
 -- | `send` skips the stop gate and is for policies only.
 type Host spec id s b =
   { handle :: AggregateHandle spec id b
@@ -200,26 +186,6 @@ type Host spec id s b =
   , onCommit :: (Array (Fact id s spec) -> Effect Unit) -> Effect Unit
   , afterCommit :: (Array (Envelope id (Event spec)) -> Aff Int) -> Effect Unit
   }
-
--- | A committed event with its stream's state right after it, which is
--- | what a keyed view reads its row key from.
-type Fact id s spec = { envelope :: Envelope id (Event spec), state :: s }
-
-type Stream id s spec =
-  { state :: s, version :: Version, history :: CatQueue (Envelope id (Event spec)) }
-
-type Stored id spec b =
-  { receipt :: Receipt (Event spec) b, envelopes :: Array (Envelope id (Event spec)) }
-
--- | Receipts are kept per aggregate: a command id names one command to one
--- | aggregate, so a retry finds its receipt and commits nothing new.
-type Store id s spec b =
-  { streams :: Map String (Stream id s spec), receipts :: Map CommandId (Stored id spec b) }
-
-data Outcome id spec b
-  = Committed (Stored id spec b)
-  | Duplicate (Stored id spec b)
-  | Refused (Rejection spec)
 
 newHost ::
   forall spec id s c e r b.
@@ -230,53 +196,25 @@ newHost ::
   Aggregate spec ->
   Effect (Host spec id s b)
 newHost system name aggregate = do
-  store <- Ref.new ({ streams: Map.empty, receipts: Map.empty } :: Store id s spec b)
+  streams <- Ref.new (Map.empty :: Map StreamId (Stream id s spec b))
   views <- Ref.new ([] :: Array (Array (Fact id s spec) -> Effect Unit))
   policies <- Ref.new ([] :: Array (Array (Envelope id (Event spec)) -> Aff Int))
   let
     options = system.options
 
-    empty :: Stream id s spec
-    empty = { state: (decider aggregate).initial, version: zeroVersion, history: CatQueue.empty }
-
-    -- Runs in one synchronous effect, so the commit, the receipt, and every
-    -- view update land together.
-    decide :: CommandId -> id -> StreamId -> Instant -> Command spec -> Effect (Outcome id spec b)
+    -- One synchronous effect, so the commit and every view update land
+    -- together.
+    decide :: CommandId -> id -> StreamId -> Instant -> Command spec -> Effect (Turn id s spec b)
     decide commandId id stream at sent = do
-      current <- Ref.read store
-      case Map.lookup commandId current.receipts of
-        Just stored -> pure (Duplicate stored)
-        Nothing -> do
-          let
-            streamState = fromMaybe empty (Map.lookup (unwrap id) current.streams)
-          case commit aggregate streamState.state sent of
-            Left refused -> pure (Refused refused)
-            Right committed -> do
-              let
-                count = length committed.events
-                envelopes = zipWith (\seq fact -> { id, stream, seq, commandId, at, event: fact })
-                  (sequencesAfter streamState.version count) committed.events
-                version = advance streamState.version count
-                stored =
-                  { receipt:
-                      { commandId, version, events: committed.events, reply: committed.reply }
-                  , envelopes
-                  }
-                next =
-                  { state: committed.state
-                  , version
-                  , history: foldl CatQueue.snoc streamState.history envelopes
-                  }
-              Ref.write
-                { streams: Map.insert (unwrap id) next current.streams
-                , receipts: Map.insert commandId stored current.receipts
-                }
-                store
-              let
-                states = scanl (decider aggregate).evolve streamState.state committed.events
-                facts = zipWith { envelope: _, state: _ } envelopes states
-              Ref.read views >>= \subscribers -> for_ subscribers (_ $ facts)
-              pure (Committed stored)
+      current <- fromMaybe (open aggregate stream id) <<< Map.lookup stream <$> Ref.read streams
+      let
+        decided = turn aggregate at commandId sent current
+      case decided of
+        Committed committed -> do
+          Ref.modify_ (Map.insert stream committed.stream) streams
+          Ref.read views >>= \subscribers -> for_ subscribers (_ $ committed.facts)
+        _ -> pure unit
+      pure decided
 
     -- Policies run after the stream's turn, so an order can target any
     -- stream without deadlock. A duplicate re-runs them: orders carry
@@ -293,32 +231,34 @@ newHost system name aggregate = do
       let
         stream = streamOf name (unwrap id)
       startedAt <- options.now
-      outcome <- Serial.run system.serial (streamIdText stream) do
+      decided <- serially system.serial (streamIdText stream) do
         options.hooks.beforeCommand stream
         at <- options.now
-        decided <- liftEffect (decide commandId id stream at sent)
+        result <- liftEffect (decide commandId id stream at sent)
         options.hooks.afterCommand stream
-        pure decided
-      ordered <- case outcome of
-        Committed stored -> propagate stored.envelopes
-        Duplicate stored -> propagate stored.envelopes
-        Refused _ -> pure 0
+        pure result
+      let
+        settled = case decided of
+          Committed committed -> Right committed.stored
+          Duplicate stored -> Right stored
+          Refused refused -> Left refused
+      ordered <- either (\_ -> pure 0) (propagate <<< _.envelopes) settled
       finishedAt <- options.now
       options.trace
         { name: "command." <> name
         , startedAt
         , duration: diff finishedAt startedAt
-        , attributes: attributes commandId stream sent outcome ordered
+        , attributes: attributes commandId stream sent decided ordered
         }
-      pure case outcome of
-        Committed stored -> Right stored.receipt
-        Duplicate stored -> Right stored.receipt
-        Refused refused -> Left refused
+      pure (map _.receipt settled)
 
     history :: id -> Aff (Array (Envelope id (Event spec)))
     history id = liftEffect do
-      current <- Ref.read store
-      pure (maybe [] (Array.fromFoldable <<< _.history) (Map.lookup (unwrap id) current.streams))
+      current <- Ref.read streams
+      pure
+        ( maybe [] (Array.fromFoldable <<< _.history)
+            (Map.lookup (streamOf name (unwrap id)) current)
+        )
 
   pure
     { handle: { send: \commandId id sent -> admitted system (send commandId id sent), history }
@@ -333,17 +273,17 @@ attributes ::
   CommandId ->
   StreamId ->
   Command spec ->
-  Outcome id spec b ->
+  Turn id s spec b ->
   Int ->
   Map String String
-attributes commandId stream sent outcome ordered = Map.fromFoldable
+attributes commandId stream sent decided ordered = Map.fromFoldable
   ( [ Tuple "command.id" (commandIdText commandId)
     , Tuple "stream.id" (streamIdText stream)
     , Tuple "command.name" (tagOf sent)
     , Tuple "policy.orders" (show ordered)
     ]
-      <> case outcome of
-        Committed stored -> committedAttributes "committed" stored
+      <> case decided of
+        Committed committed -> committedAttributes "committed" committed.stored
         Duplicate stored -> committedAttributes "duplicate" stored
         Refused refused -> [ Tuple "outcome" "rejected", Tuple "rejection" (tagOf refused) ]
   )
@@ -488,3 +428,130 @@ else instance Fail
   ( Above (Text "a view or policy reads an aggregate this context does not contain:") (Quote spec)
   ) =>
   FindAggregate spec Nil l
+
+-- | A keyed serial executor: work for one key runs one job at a time in
+-- | arrival order, and different keys run concurrently. Each key has a
+-- | bounded mailbox, so a fast producer waits instead of growing memory.
+newtype Serial =
+  Serial { capacity :: Int, workers :: Ref (Map String Worker), closed :: Ref Boolean }
+
+type Worker = { mailbox :: Mailbox, fiber :: Fiber Unit }
+
+newSerial :: Int -> Effect Serial
+newSerial capacity = do
+  workers <- Ref.new Map.empty
+  closed <- Ref.new false
+  pure (Serial { capacity: max 1 capacity, workers, closed })
+
+-- | Run `job` after every job already queued for `key`. Fails once the
+-- | executor is closed.
+serially :: forall a. Serial -> String -> Aff a -> Aff a
+serially serial@(Serial state) key job = do
+  worker <- workerFor serial key
+  result <- liftEffect EffectAVar.empty
+  reserve worker.mailbox
+  -- The closed check and the post share one effect: `closeSerial` either
+  -- finds this job queued or this caller observes the close.
+  accepted <- liftEffect do
+    closed <- Ref.read state.closed
+    if closed
+    then unreserve worker.mailbox $> false
+    else post worker.mailbox (attempt job >>= \outcome -> AVar.put outcome result) $> true
+  unless accepted (throwError (error ("Domain.Runtime: " <> key <> " is shut down")))
+  AVar.take result >>= either throwError pure
+
+-- | Refuse new work, finish queued work, and wait for every worker to exit.
+closeSerial :: Serial -> Aff Unit
+closeSerial (Serial state) = do
+  workers <- liftEffect do
+    Ref.write true state.closed
+    current <- Ref.read state.workers
+    for_ current \worker -> wake worker.mailbox
+    pure current
+  for_ workers \worker -> joinFiber worker.fiber
+
+workerFor :: Serial -> String -> Aff Worker
+workerFor serial@(Serial state) key = do
+  closed <- liftEffect (Ref.read state.closed)
+  when closed (throwError (error ("Domain.Runtime: " <> key <> " is shut down")))
+  liftEffect do
+    current <- Ref.read state.workers
+    case Map.lookup key current of
+      Just worker -> pure worker
+      Nothing -> do
+        mailbox <- mkMailbox state.capacity
+        fiber <- launchAff (loop serial mailbox)
+        let
+          worker = { mailbox, fiber }
+        Ref.modify_ (Map.insert key worker) state.workers
+        pure worker
+
+loop :: Serial -> Mailbox -> Aff Unit
+loop serial@(Serial state) mailbox = do
+  next <- liftEffect (claim mailbox)
+  case next of
+    Just job -> job *> loop serial mailbox
+    Nothing -> do
+      closed <- liftEffect (Ref.read state.closed)
+      unless closed (awaitWork mailbox *> loop serial mailbox)
+
+-- | A bounded FIFO. Posting and waking share one effect so a queued job is
+-- | never left without a wake token; claiming a job frees its slot.
+newtype Mailbox =
+  Mailbox { pending :: Ref (CatQueue (Aff Unit)), ready :: AVar Unit, slots :: Semaphore }
+
+mkMailbox :: Int -> Effect Mailbox
+mkMailbox capacity = do
+  pending <- Ref.new CatQueue.empty
+  ready <- EffectAVar.empty
+  slots <- mkSemaphore capacity
+  pure (Mailbox { pending, ready, slots })
+
+post :: Mailbox -> Aff Unit -> Effect Unit
+post (Mailbox box) job = do
+  Ref.modify_ (\pending -> CatQueue.snoc pending job) box.pending
+  void (EffectAVar.tryPut unit box.ready)
+
+claim :: Mailbox -> Effect (Maybe (Aff Unit))
+claim (Mailbox box) = do
+  pending <- Ref.read box.pending
+  case CatQueue.uncons pending of
+    Nothing -> pure Nothing
+    Just (Tuple job rest) -> do
+      Ref.write rest box.pending
+      release box.slots
+      pure (Just job)
+
+awaitWork :: Mailbox -> Aff Unit
+awaitWork (Mailbox box) = AVar.take box.ready
+
+wake :: Mailbox -> Effect Unit
+wake (Mailbox box) = void (EffectAVar.tryPut unit box.ready)
+
+reserve :: Mailbox -> Aff Unit
+reserve (Mailbox box) = acquire box.slots
+
+unreserve :: Mailbox -> Effect Unit
+unreserve (Mailbox box) = release box.slots
+
+-- | A counting semaphore whose counter changes only inside synchronous
+-- | effects. `gate` is full exactly when a permit is available.
+newtype Semaphore = Semaphore { permits :: Ref Int, gate :: AVar Unit }
+
+mkSemaphore :: Int -> Effect Semaphore
+mkSemaphore permits = do
+  remaining <- Ref.new permits
+  gate <- EffectAVar.new unit
+  pure (Semaphore { permits: remaining, gate })
+
+acquire :: Semaphore -> Aff Unit
+acquire (Semaphore state) = do
+  AVar.take state.gate
+  liftEffect do
+    remaining <- Ref.modify (_ - 1) state.permits
+    when (remaining > 0) (void (EffectAVar.tryPut unit state.gate))
+
+release :: Semaphore -> Effect Unit
+release (Semaphore state) = do
+  permits <- Ref.modify (_ + 1) state.permits
+  when (permits == 1) (void (EffectAVar.tryPut unit state.gate))
