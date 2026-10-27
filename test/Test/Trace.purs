@@ -22,9 +22,9 @@ testTrace = do
   rt <- start bank options
   let
     sam = AccountId "a-1"
-  _ <- rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" })
+  _ <- rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
   _ <- rt.account.send (commandId "overdraw") sam (cmd @"withdrawMoney" { amount: 5 })
-  _ <- rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" })
+  _ <- rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
   _ <- rt.customer.send (commandId "register") (CustomerId "c-1")
     (cmd @"registerCustomer" { name: "ada" })
   rt.stop

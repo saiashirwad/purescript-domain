@@ -6,8 +6,8 @@ module Bank (bank) where
 import Bank.Account (account)
 import Bank.Customer (customer)
 import Bank.Policy (provisioning)
-import Bank.Views (statement, summary)
+import Bank.Views (dashboard, statement, summary)
 
 -- | No signature: every entry carries its own type, and a record type here
 -- | would restate each one.
-bank = { account, customer, summary, statement, provisioning }
+bank = { account, customer, summary, statement, dashboard, provisioning }

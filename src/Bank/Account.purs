@@ -1,8 +1,10 @@
-module Bank.Account (AccountId(..), AccountState(..), Account, Movement, account) where
+module Bank.Account (AccountId(..), AccountState(..), Account, Movement, account, customerOf) where
 
 import Prelude
 
+import Bank.Customer (CustomerId)
 import Data.Generic.Rep (class Generic)
+import Data.Maybe (Maybe(..))
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
 import Data.Variant (Variant)
@@ -15,7 +17,7 @@ derive newtype instance Eq AccountId
 derive newtype instance Ord AccountId
 derive newtype instance Show AccountId
 
-data AccountState = Unopened | Open { owner :: String, balance :: Int }
+data AccountState = Unopened | Open { owner :: CustomerId, balance :: Int }
 
 derive instance Eq AccountState
 derive instance Generic AccountState _
@@ -33,13 +35,13 @@ type Account =
   , state :: AccountState
   , command ::
       Variant
-        ( openAccount :: { owner :: String }
+        ( openAccount :: { owner :: CustomerId }
         , depositMoney :: { amount :: Int }
         , withdrawMoney :: { amount :: Int }
         )
   , event ::
       Variant
-        ( accountOpened :: { owner :: String }
+        ( accountOpened :: { owner :: CustomerId }
         , moneyDeposited :: Movement
         , moneyWithdrawn :: Movement
         )
@@ -61,8 +63,8 @@ account = aggregate
 
 openAccount ::
   AccountState ->
-  { owner :: String } ->
-  Decision (alreadyOpen :: {}) (accountOpened :: { owner :: String })
+  { owner :: CustomerId } ->
+  Decision (alreadyOpen :: {}) (accountOpened :: { owner :: CustomerId })
 openAccount Unopened { owner } = emit @"accountOpened" { owner }
 openAccount (Open _) _ = reject @"alreadyOpen" {}
 
@@ -88,3 +90,7 @@ settle Unopened _ = Unopened
 balanceOf :: AccountState -> Int
 balanceOf Unopened = 0
 balanceOf (Open { balance }) = balance
+
+customerOf :: AccountState -> Maybe CustomerId
+customerOf Unopened = Nothing
+customerOf (Open { owner }) = Just owner

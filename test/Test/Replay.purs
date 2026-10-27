@@ -3,6 +3,7 @@ module Test.Replay (testReplay) where
 import Prelude
 
 import Bank.Account (Account, AccountState(..), account)
+import Bank.Customer (CustomerId(..))
 import Data.Array.NonEmpty (cons')
 import Data.Either (Either(..))
 import Domain (Command, Event, cmd, commit, event, replay)
@@ -11,8 +12,8 @@ import Effect.Class (liftEffect)
 import Test.QuickCheck (quickCheck, (===))
 import Test.QuickCheck.Gen (Gen, arrayOf, chooseInt, elements, oneOf)
 
-genOwner :: Gen String
-genOwner = elements (cons' "sam" [ "kim", "ada" ])
+genOwner :: Gen CustomerId
+genOwner = CustomerId <$> elements (cons' "sam" [ "kim", "ada" ])
 
 genEvent :: Gen (Event Account)
 genEvent = oneOf (cons' (opened <$> genOwner) [ movement moneyDeposited, movement moneyWithdrawn ])

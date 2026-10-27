@@ -78,6 +78,19 @@ expect "emit label not in narrow row" src/Bank/Account.purs \
 expect "view handles undeclared event" src/Bank/Views.purs \
   "moneyWithdrawn: \\lines" "moneyWithdrew: \\lines" \
   "a view handles an undeclared event moneyWithdrew"
+expect "keyed view handles undeclared event" src/Bank/Views.purs \
+  "moneyDeposited: \\row" "moneyDepositd: \\row" \
+  "a view handles an undeclared event moneyDepositd"
+expect "keyed view without a key" src/Bank/Views.purs \
+  "  , key: customerOf
+" "" \
+  "a view with rows keyed by CustomerId needs key :: AccountState -> Maybe CustomerId"
+expect "view key of the wrong type" src/Bank/Views.purs \
+  "dashboard :: View Account CustomerId Dashboard" "dashboard :: View Account AccountId Dashboard" \
+  "but its key is AccountState -> Maybe CustomerId"
+expect "misspelled view key field" src/Bank/Views.purs \
+  "key: customerOf" "kye: customerOf" \
+  "a view definition has the fields initial and on, and optionally key"
 expect "policy orders unknown command" src/Bank/Policy.purs \
   'order @"openAccount"' 'order @"openAcount"' \
   "the target aggregate declares no command openAcount"
@@ -86,13 +99,13 @@ expect "spec missing a field" src/Bank/Customer.purs \
   }" "  }" \
   "an aggregate spec needs the field reply"
 expect "context entry of wrong kind" src/Bank.purs \
-  "bank = { account, customer, summary, statement, provisioning }" "bank = { account, customer, summary, statement, provisioning: 3 }" \
+  "bank = { account, customer, summary, statement, dashboard, provisioning }" "bank = { account, customer, summary, statement, dashboard, provisioning: 3 }" \
   "a context entry must be an Aggregate, a View, or a Policy, but provisioning is Int"
 expect "narrow payload differs from spec" src/Bank/Account.purs \
-  'Decision (alreadyOpen :: {}) (accountOpened :: { owner :: String })
+  'Decision (alreadyOpen :: {}) (accountOpened :: { owner :: CustomerId })
 openAccount Unopened { owner } = emit @"accountOpened" { owner }
 openAccount (Open _) _ = reject @"alreadyOpen" {}' \
-  'Decision (alreadyOpen :: Unit) (accountOpened :: { owner :: String })
+  'Decision (alreadyOpen :: Unit) (accountOpened :: { owner :: CustomerId })
 openAccount Unopened { owner } = emit @"accountOpened" { owner }
 openAccount (Open _) _ = reject @"alreadyOpen" unit' \
   "is Unit here but {} in the spec"
@@ -100,11 +113,11 @@ expect "cmd with misspelled label" test/Test/Runtime.purs \
   'cmd @"depositMoney" { amount: 100 })' 'cmd @"depositMony" { amount: 100 })' \
   "the aggregate declares no command depositMony"
 expect "event sent as a command" test/Test/Runtime.purs \
-  '(cmd @"openAccount" { owner: "sam" })' '(event @"accountOpened" { owner: "sam" })' \
+  '(cmd @"openAccount" { owner: CustomerId "sam" })' '(event @"accountOpened" { owner: CustomerId "sam" })' \
   "Cannot unify 'Command' with 'Event'"
 expect "missing guard" src/Bank/Api.purs \
   "  , statement: ownsAccount
-  }" "  }" \
+" "" \
   "Missing required properties: statement"
 
 # KNOWN: not a custom error. The span is the enclosing signature, not the
@@ -116,10 +129,10 @@ expect "cmd with wrong payload (KNOWN: plain unification error)" test/Test/Runti
 # KNOWN: a custom error, but it prints the whole aggregate spec after the
 # header instead of naming the aggregate.
 expect "view over an aggregate missing from the context (KNOWN: spec dump)" src/Bank.purs \
-  "bank = { account, customer, summary, statement, provisioning }" "bank = { customer, summary, statement, provisioning }" \
+  "bank = { account, customer, summary, statement, dashboard, provisioning }" "bank = { customer, summary, statement, dashboard, provisioning }" \
   "a view or policy reads an aggregate this context does not contain:"
 expect "view over a missing aggregate prints the spec (KNOWN: spec dump)" src/Bank.purs \
-  "bank = { account, customer, summary, statement, provisioning }" "bank = { customer, summary, statement, provisioning }" \
+  "bank = { account, customer, summary, statement, dashboard, provisioning }" "bank = { customer, summary, statement, dashboard, provisioning }" \
   "state :: AccountState"
 
 if [ "$failures" -ne 0 ]; then

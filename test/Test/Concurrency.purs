@@ -47,7 +47,8 @@ sameStreamOrder = do
   let
     sam = AccountId "a-1"
     deposits = range 1 40
-  opening <- forkAff (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" }))
+  opening <- forkAff
+    (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" }))
   depositing <- for deposits \n -> forkAff
     (rt.account.send (commandId ("deposit-" <> show n)) sam (cmd @"depositMoney" { amount: n }))
   delay (Milliseconds 20.0)
@@ -80,9 +81,13 @@ differentStreamsOverlap = do
         }
   rt <- start bank (testOptions { hooks = hooks })
   first <- forkAff
-    (rt.account.send (commandId "open-a") (AccountId "a") (cmd @"openAccount" { owner: "a" }))
+    ( rt.account.send (commandId "open-a") (AccountId "a")
+        (cmd @"openAccount" { owner: CustomerId "a" })
+    )
   second <- forkAff
-    (rt.account.send (commandId "open-b") (AccountId "b") (cmd @"openAccount" { owner: "b" }))
+    ( rt.account.send (commandId "open-b") (AccountId "b")
+        (cmd @"openAccount" { owner: CustomerId "b" })
+    )
   delay (Milliseconds 50.0)
   overlapped <- AVar.tryRead bothStarted
   AVar.put unit gate
@@ -117,7 +122,7 @@ boundedMailbox = do
       receipt <- rt.account.send (commandId key) sam command
       liftEffect (Ref.modify_ (_ + 1) completed)
       pure receipt
-  opening <- forkAff (send "open" (cmd @"openAccount" { owner: "sam" }))
+  opening <- forkAff (send "open" (cmd @"openAccount" { owner: CustomerId "sam" }))
   AVar.take started
   queued <- forkAff (send "deposit-1" (cmd @"depositMoney" { amount: 100 }))
   delay (Milliseconds 20.0)
@@ -159,7 +164,8 @@ failureIsolation = do
   rt <- start bank (testOptions { hooks = hooks })
   let
     sam = AccountId "a-1"
-  failed <- attempt (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" }))
+  failed <- attempt
+    (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" }))
   case failed of
     Left exception -> assertThat "the caller sees the hook failure"
       (contains (Pattern "hook failure") (message exception))
@@ -170,7 +176,7 @@ failureIsolation = do
   assertEqual "a domain rejection survives the stream" (Left (rejection @"notOpen" {}))
     (map _.events refused)
   opened <- expectRight "retry open"
-    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" })
+    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
   assertEqual "the same id runs again after a hook failure" 1 (versionNumber opened.version)
   rt.stop
 
@@ -193,7 +199,8 @@ shutdownDrains = do
   rt <- start bank (testOptions { hooks = hooks })
   let
     sam = AccountId "a-1"
-  opening <- forkAff (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" }))
+  opening <- forkAff
+    (rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" }))
   AVar.take started
   depositing <-
     forkAff (rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 }))
@@ -230,5 +237,4 @@ shutdownDrainsCascades = do
   rt.stop
   _ <- joinFiber registering >>= expectRight "register"
   provisioned <- rt.summary.read (mainAccount ada)
-  assertEqual "stop waits for the policy cascade" (Just { owner: Just "ada", balance: 0 })
-    provisioned
+  assertEqual "stop waits for the policy cascade" (Just { owner: Just ada, balance: 0 }) provisioned

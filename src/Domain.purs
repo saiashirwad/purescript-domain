@@ -11,9 +11,9 @@
 -- |   }
 -- | ```
 -- |
--- | Every other type takes that spec as its only parameter: `Aggregate
--- | Account`, `Command Account`, `View Account Summary`, `Policy Customer
--- | Account`. Handlers are records keyed by label. The library walks them
+-- | Every other type takes that spec as its first parameter: `Aggregate
+-- | Account`, `Command Account`, `View Account AccountId Summary`, `Policy
+-- | Customer Account`. Handlers are records keyed by label. The library walks them
 -- | against the spec, so a missing or misspelled handler is one compile
 -- | error that names the label.
 module Domain
@@ -40,6 +40,8 @@ module Domain
   , View
   , view
   , runView
+  , class ViewDefinition
+  , viewDefinition
   , Policy
   , policy
   , Order
@@ -63,7 +65,7 @@ import Data.Bifunctor (bimap)
 import Data.DateTime.Instant (Instant)
 import Data.Either (Either(..))
 import Data.Foldable (foldl)
-import Data.Maybe (maybe)
+import Data.Maybe (Maybe(..), maybe)
 import Data.Symbol (class IsSymbol, reflectSymbol)
 import Data.Variant (class VariantShows, Variant)
 import Data.Variant.Internal (class VariantTags, VariantRep(..))
@@ -84,8 +86,10 @@ import Domain.Id (derivedCommandId)
 import Domain.Labels (class Covers, class Field, class IsVariant, class SubRow)
 import Foreign.Object (Object)
 import Foreign.Object as Object
+import Partial.Unsafe (unsafeCrashWith)
 import Prim.Row as Row
 import Prim.RowList (class RowToList, Cons, Nil, RowList)
+import Prim.TypeError (class Fail, Above, Beside, Quote, Text)
 import Record as Record
 import Type.Proxy (Proxy(..))
 import Unsafe.Coerce (unsafeCoerce)
@@ -299,29 +303,108 @@ replay ::
   forall spec id s c e r b. Spec spec id s c e r b => Aggregate spec -> s -> Array (Event spec) -> s
 replay aggregate' = foldl (decider aggregate').evolve
 
--- | A read model over one aggregate's events, kept per entity id. Handlers
--- | name only the events the view cares about.
-newtype View :: Type -> Type -> Type
-newtype View spec v = View { initial :: v, step :: v -> Event spec -> v }
+-- | A read model over one aggregate's events: one row of `v` per key `k`.
+-- | Handlers name only the events the view cares about. Rows are keyed by
+-- | the source entity id unless the definition has a `key`, which reads the
+-- | entity's state right after each event and names the row the event lands
+-- | in, or `Nothing` to skip it.
+newtype View :: Type -> Type -> Type -> Type
+newtype View spec k v =
+  View { initial :: v, step :: v -> Event spec -> v, key :: Erased -> Erased -> Maybe k }
 
-type role View nominal representational
+type role View nominal representational representational
 
 view ::
-  forall spec id s c e r b v hs hrl erl.
+  forall spec id s c e r b k v def drl hs hrl erl.
   Spec spec id s c e r b =>
+  RowToList def drl =>
+  ViewDefinition drl def id s k v hs =>
   RowToList hs hrl =>
   RowToList e erl =>
   Table "a view handles an undeclared event " hrl hs erl v v =>
-  { initial :: v, on :: Record hs } ->
-  View spec v
-view definition =
-  View { initial: definition.initial, step: \state (Event v) -> dispatch handlers identity state v }
+  Record def ->
+  View spec k v
+view definition = View
+  { initial: parts.initial
+  , step: \state (Event v) -> dispatch handlers identity state v
+  , key: unsafeCoerce parts.key
+  }
   where
+  parts :: { initial :: v, on :: Record hs, key :: id -> s -> Maybe k }
+  parts = viewDefinition (Proxy :: Proxy drl) definition
   handlers = table (Proxy :: Proxy "a view handles an undeclared event ") (Proxy :: Proxy erl)
-    (Proxy :: Proxy hrl) definition.on
+    (Proxy :: Proxy hrl) parts.on
 
-runView :: forall spec v. View spec v -> { initial :: v, step :: v -> Event spec -> v }
-runView (View fold) = fold
+runView ::
+  forall spec id s c e r b k v.
+  Spec spec id s c e r b =>
+  View spec k v ->
+  { initial :: v, step :: v -> Event spec -> v, key :: id -> s -> Maybe k }
+runView (View fold) = fold { key = unsafeCoerce fold.key }
+
+-- | Reads a view definition: `{ initial, on }`, keyed by the source id, or
+-- | `{ initial, key, on }`.
+class ViewDefinition ::
+  RowList Type -> Row Type -> Type -> Type -> Type -> Type -> Row Type -> Constraint
+class ViewDefinition drl def id s k v hs | drl -> v hs where
+  viewDefinition ::
+    Proxy drl -> Record def -> { initial :: v, on :: Record hs, key :: id -> s -> Maybe k }
+
+instance (Row.Cons "initial" v initialTail def, Row.Cons "on" (Record hs) onTail def) =>
+  ViewDefinition (Cons "initial" v (Cons "on" (Record hs) Nil)) def id s id v hs where
+  viewDefinition _ definition =
+    { initial: Record.get (Proxy :: Proxy "initial") definition
+    , on: Record.get (Proxy :: Proxy "on") definition
+    , key: \id _ -> Just id
+    }
+else instance Fail
+  ( Beside
+      (Text "a view with rows keyed by ")
+      ( Beside
+          (Quote k)
+          (Beside (Text " needs key :: ") (Beside (Quote s) (Beside (Text " -> Maybe ") (Quote k))))
+      )
+  ) =>
+  ViewDefinition (Cons "initial" v (Cons "on" (Record hs) Nil)) def id s k v hs where
+  viewDefinition _ _ = unsafeCrashWith "unreachable: rejected at compile time"
+else instance ( Row.Cons "initial" v initialTail def
+              , Row.Cons "key" f keyTail def
+              , Row.Cons "on" (Record hs) onTail def
+              , ViewKey f s k
+              ) =>
+  ViewDefinition (Cons "initial" v (Cons "key" f (Cons "on" (Record hs) Nil))) def id s k v hs where
+  viewDefinition _ definition =
+    { initial: Record.get (Proxy :: Proxy "initial") definition
+    , on: Record.get (Proxy :: Proxy "on") definition
+    , key: \_ -> viewKey (Record.get (Proxy :: Proxy "key") definition)
+    }
+else instance Fail (Text "a view definition has the fields initial and on, and optionally key") =>
+  ViewDefinition drl def id s k v hs where
+  viewDefinition _ _ = unsafeCrashWith "unreachable: rejected at compile time"
+
+-- | A view's key reads the aggregate's state and names a row.
+class ViewKey :: Type -> Type -> Type -> Constraint
+class ViewKey f s k where
+  viewKey :: f -> s -> Maybe k
+
+instance ViewKey (s -> Maybe k) s k where
+  viewKey = identity
+else instance Fail
+  ( Above
+      ( Beside
+          (Text "a view keyed by ")
+          ( Beside
+              (Quote k)
+              ( Beside
+                  (Text " needs key :: ")
+                  (Beside (Quote s) (Beside (Text " -> Maybe ") (Quote k)))
+              )
+          )
+      )
+      (Beside (Text "but its key is ") (Quote f))
+  ) =>
+  ViewKey f s k where
+  viewKey _ _ = unsafeCrashWith "unreachable: rejected at compile time"
 
 -- | Reacts to events of `src` by ordering commands on `tgt`.
 newtype Policy :: Type -> Type -> Type

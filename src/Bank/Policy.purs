@@ -11,8 +11,8 @@ import Domain (Policy, order, policy)
 -- | or a retry addresses the same command.
 provisioning :: Policy Customer Account
 provisioning = policy
-  { customerRegistered: \customerId { name } ->
-      [ order @"openAccount" (mainAccount customerId) { owner: name } ]
+  { customerRegistered: \customerId _ ->
+      [ order @"openAccount" (mainAccount customerId) { owner: customerId } ]
   }
 
 mainAccount :: CustomerId -> AccountId

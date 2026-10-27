@@ -5,12 +5,12 @@ import Prelude
 import Bank (bank)
 import Bank.Account (AccountId(..))
 import Bank.Api (Principal, guards)
+import Bank.Customer (CustomerId(..))
 import Data.Argonaut.Core (fromString, jsonEmptyObject, stringify)
 import Data.Argonaut.Encode (encodeJson)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
-import Data.Tuple (Tuple(..))
 import Domain.Http (Method(..), serve)
 import Domain.Runtime (start)
 import Effect.Aff (Aff)
@@ -21,8 +21,14 @@ testHttp = do
   rt <- start bank testOptions
   let
     sam :: Principal
-    sam = { subject: "sam", roles: Set.empty, accounts: Set.singleton (AccountId "a-1") }
-    admin = { subject: "root", roles: Set.singleton "admin", accounts: Set.empty }
+    sam =
+      { subject: "sam"
+      , roles: Set.empty
+      , customer: Just (CustomerId "sam")
+      , accounts: Set.singleton (AccountId "a-1")
+      }
+    admin =
+      { subject: "root", roles: Set.singleton "admin", customer: Nothing, accounts: Set.empty }
     call who method path key query body = serve bank guards rt who
       { method
       , path
@@ -52,12 +58,12 @@ testHttp = do
   summary <- get sam "/summary/a-1" []
   assertEqual "a view route is 200" 200 summary.status
   assertJson "a view route reads the view" """{"balance":70,"owner":"sam"}""" summary.body
-  atLeast <- get sam "/summary/a-1" [ Tuple "atLeast" "2" ]
-  assertEqual "atLeast waits for a version already reached" 200 atLeast.status
   statement <- get sam "/statement/a-1" []
   assertJson "another view route" """[{"kind":"deposit","amount":70,"balance":70}]""" statement.body
-  missing <- get sam "/summary/a-1" [ Tuple "atLeast" "x" ]
-  assertEqual "a malformed atLeast is 400" 400 missing.status
+  dashboard <- get sam "/dashboard/sam" []
+  assertEqual "a keyed view route is 200" 200 dashboard.status
+  assertJson "a keyed view route reads the customer's row" """{"accounts":1,"balance":70}"""
+    dashboard.body
 
   badPayload <- post sam "/account/a-1/depositMoney" "k-bad" (encodeJson { amount: "lots" })
   assertEqual "a payload of the wrong shape is 400" 400 badPayload.status
@@ -80,6 +86,10 @@ testHttp = do
 
   strangerView <- get sam "/summary/a-2" []
   assertEqual "a view guard denies another's account" 403 strangerView.status
+  strangerDashboard <- get sam "/dashboard/kim" []
+  assertEqual "a keyed view guard denies another customer's row" 403 strangerDashboard.status
+  wrongMethodDashboard <- post sam "/dashboard/sam" "k-z" jsonEmptyObject
+  assertEqual "a keyed view route rejects POST with 405" 405 wrongMethodDashboard.status
   strangerCommand <- post sam "/account/a-2/openAccount" "k-steal" (encodeJson { owner: "sam" })
   assertEqual "a command guard denies another's account" 403 strangerCommand.status
   register <- post sam "/customer/c-9/registerCustomer" "k-reg" (encodeJson { name: "sam" })
@@ -88,6 +98,11 @@ testHttp = do
   assertEqual "an admin may" 200 adminRegister.status
   adminView <- get admin "/summary/c-9-main" []
   assertEqual "an admin reads the policy's account" 200 adminView.status
+  adminDashboard <- get admin "/dashboard/c-9" []
+  assertJson "an admin reads the customer's row the policy opened" """{"accounts":1,"balance":0}"""
+    adminDashboard.body
+  noRow <- get admin "/dashboard/c-404" []
+  assertEqual "a keyed view of nothing recorded is 404" 404 noRow.status
   rt.stop
   where
   maybe' default f = case _ of

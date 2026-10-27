@@ -3,6 +3,7 @@ module Test.Codec (testCodec) where
 import Prelude
 
 import Bank.Codec (accountEvents)
+import Bank.Customer (CustomerId(..))
 import Data.Argonaut.Parser (jsonParser)
 import Data.Either (Either(..))
 import Data.Traversable (traverse)
@@ -16,7 +17,7 @@ testCodec = do
   let
     deposited = event @"moneyDeposited" { amount: 40, balanceAfter: 40 }
     events =
-      [ event @"accountOpened" { owner: "sam" }
+      [ event @"accountOpened" { owner: CustomerId "sam" }
       , deposited
       , event @"moneyWithdrawn" { amount: 15, balanceAfter: 25 }
       ]
@@ -30,7 +31,7 @@ testCodec = do
         =<< jsonParser """{"version":1,"payload":{"type":"moneyDeposited","value":{"amount":40}}}"""
     )
   assertEqual "version 1 events the upcaster does not touch decode unchanged"
-    (Right (event @"accountOpened" { owner: "sam" }))
+    (Right (event @"accountOpened" { owner: CustomerId "sam" }))
     ( decode accountEvents
         =<< jsonParser
               """{"version":1,"payload":{"type":"accountOpened","value":{"owner":"sam"}}}"""

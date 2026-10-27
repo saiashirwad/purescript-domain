@@ -6,19 +6,23 @@ import Bank (bank)
 import Bank.Account (AccountId(..))
 import Bank.Customer (CustomerId(..))
 import Bank.Policy (mainAccount)
-import Data.Array (length)
+import Data.Array (length, range)
 import Data.Either (Either(..))
+import Data.Foldable (for_)
 import Data.Maybe (Maybe(..))
+import Data.Traversable (for)
 import Domain (cmd, event, rejection, sequenceNumber, versionNumber)
 import Domain.Runtime (start)
-import Effect.Aff (Aff)
-import Test.Support (assertEqual, commandId, expectRight, testOptions)
+import Effect.Aff (Aff, forkAff, joinFiber)
+import Test.Support (assertEqual, commandId, expectRight, isLeft, testOptions)
 
 testRuntime :: Aff Unit
 testRuntime = do
   exactlyOnce
   rejectionStoresNothing
   views
+  dashboard
+  dashboardUnderConcurrency
   policy
 
 exactlyOnce :: Aff Unit
@@ -27,8 +31,9 @@ exactlyOnce = do
   let
     sam = AccountId "a-1"
   opened <- expectRight "open"
-    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" })
-  assertEqual "open records the event" [ event @"accountOpened" { owner: "sam" } ] opened.events
+    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
+  assertEqual "open records the event" [ event @"accountOpened" { owner: CustomerId "sam" } ]
+    opened.events
   deposited <- expectRight "deposit"
     =<< rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 })
   assertEqual "deposit replies with the balance" 100 deposited.reply.balance
@@ -54,7 +59,7 @@ rejectionStoresNothing = do
   let
     sam = AccountId "a-1"
   _ <- expectRight "open"
-    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" })
+    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
   refused <- rt.account.send (commandId "overdraw") sam (cmd @"withdrawMoney" { amount: 500 })
   assertEqual "an overdraft is refused"
     (Left (rejection @"insufficientFunds" { balance: 0, requested: 500 })) (map _.events refused)
@@ -77,29 +82,23 @@ views = do
   before <- rt.summary.read sam
   assertEqual "a view of an unseen entity is empty" Nothing before
 
-  opened <- expectRight "open"
-    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: "sam" })
+  _ <- expectRight "open"
+    =<< rt.account.send (commandId "open") sam (cmd @"openAccount" { owner: CustomerId "sam" })
   afterOpen <- rt.summary.read sam
-  assertEqual "a read right after send sees the open" (Just { owner: Just "sam", balance: 0 })
-    afterOpen
-  assertEqual "the open receipt is version 1" 1 (versionNumber opened.version)
+  assertEqual "a read right after send sees the open"
+    (Just { owner: Just (CustomerId "sam"), balance: 0 }) afterOpen
 
-  deposited <- expectRight "deposit"
+  _ <- expectRight "deposit"
     =<< rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 })
   afterDeposit <- rt.summary.read sam
-  assertEqual "a read right after send sees the deposit" (Just { owner: Just "sam", balance: 100 })
-    afterDeposit
+  assertEqual "a read right after send sees the deposit"
+    (Just { owner: Just (CustomerId "sam"), balance: 100 }) afterDeposit
 
-  withdrawn <- expectRight "withdraw"
+  _ <- expectRight "withdraw"
     =<< rt.account.send (commandId "withdraw") sam (cmd @"withdrawMoney" { amount: 30 })
   afterWithdraw <- rt.summary.read sam
   assertEqual "a read right after send sees the withdrawal"
-    (Just { owner: Just "sam", balance: 70 }) afterWithdraw
-  caughtUp <- rt.summary.readAt withdrawn.version sam
-  assertEqual "readAt sees the version the receipt names" (Just 70) (map _.balance caughtUp)
-  atDeposit <- rt.summary.readAt deposited.version sam
-  assertEqual "readAt a version already passed returns the current view" (Just 70)
-    (map _.balance atDeposit)
+    (Just { owner: Just (CustomerId "sam"), balance: 70 }) afterWithdraw
 
   _ <- rt.account.send (commandId "deposit") sam (cmd @"depositMoney" { amount: 100 })
   _ <- rt.account.send (commandId "withdraw") sam (cmd @"withdrawMoney" { amount: 30 })
@@ -124,6 +123,84 @@ views = do
     Nothing -> default
     Just value -> f value
 
+-- | One row per customer, fed by every account the customer owns. Deposits
+-- | do not name the customer; the row is found through the account's state.
+dashboard :: Aff Unit
+dashboard = do
+  rt <- start bank testOptions
+  let
+    ada = CustomerId "c-1"
+    kim = CustomerId "c-2"
+    checking = AccountId "a-1"
+    savings = AccountId "a-2"
+    send key id command = expectRight key =<< rt.account.send (commandId key) id command
+  before <- rt.dashboard.read ada
+  assertEqual "a customer without accounts has no row" Nothing before
+
+  _ <- send "open-checking" checking (cmd @"openAccount" { owner: ada })
+  afterOpen <- rt.dashboard.read ada
+  assertEqual "a read right after the open sees the account" (Just { accounts: 1, balance: 0 })
+    afterOpen
+  _ <- send "open-savings" savings (cmd @"openAccount" { owner: ada })
+  _ <- send "deposit-checking" checking (cmd @"depositMoney" { amount: 100 })
+  afterDeposit <- rt.dashboard.read ada
+  assertEqual "a read right after a deposit sees it" (Just { accounts: 2, balance: 100 })
+    afterDeposit
+  _ <- send "deposit-savings" savings (cmd @"depositMoney" { amount: 50 })
+  _ <- send "withdraw-checking" checking (cmd @"withdrawMoney" { amount: 30 })
+  both <- rt.dashboard.read ada
+  assertEqual "two accounts update one row" (Just { accounts: 2, balance: 120 }) both
+
+  _ <- send "open-savings" savings (cmd @"openAccount" { owner: ada })
+  _ <- send "deposit-checking" checking (cmd @"depositMoney" { amount: 100 })
+  _ <- send "deposit-savings" savings (cmd @"depositMoney" { amount: 50 })
+  _ <- send "withdraw-checking" checking (cmd @"withdrawMoney" { amount: 30 })
+  retried <- rt.dashboard.read ada
+  assertEqual "duplicate delivery from either account does not double-apply" both retried
+
+  refused <- rt.account.send (commandId "overdraw") savings (cmd @"withdrawMoney" { amount: 500 })
+  assertEqual "the overdraft is refused" true (isLeft refused)
+  afterRefusal <- rt.dashboard.read ada
+  assertEqual "a refused command changes no row" both afterRefusal
+
+  _ <- send "open-other" (AccountId "a-3") (cmd @"openAccount" { owner: kim })
+  _ <- send "deposit-other" (AccountId "a-3") (cmd @"depositMoney" { amount: 7 })
+  other <- rt.dashboard.read kim
+  assertEqual "another customer's account lands in another row" (Just { accounts: 1, balance: 7 })
+    other
+  unchanged <- rt.dashboard.read ada
+  assertEqual "and leaves the first row alone" both unchanged
+
+  let
+    ben = CustomerId "c-3"
+  _ <- expectRight "register"
+    =<< rt.customer.send (commandId "register") ben (cmd @"registerCustomer" { name: "ben" })
+  _ <- expectRight "retry register"
+    =<< rt.customer.send (commandId "register") ben (cmd @"registerCustomer" { name: "ben" })
+  provisioned <- rt.dashboard.read ben
+  assertEqual "the policy's account joins its customer's row once"
+    (Just { accounts: 1, balance: 0 }) provisioned
+  rt.stop
+
+-- | Deposits to two accounts of one customer run on two streams at once and
+-- | all land in the one row.
+dashboardUnderConcurrency :: Aff Unit
+dashboardUnderConcurrency = do
+  rt <- start bank testOptions
+  let
+    ada = CustomerId "c-1"
+    accounts = [ AccountId "a-1", AccountId "a-2" ]
+    amounts = range 1 20
+  for_ accounts \id ->
+    rt.account.send (commandId ("open-" <> show id)) id (cmd @"openAccount" { owner: ada })
+  fibers <- for accounts \id -> for amounts \n -> forkAff
+    (rt.account.send (commandId (show id <> "-" <> show n)) id (cmd @"depositMoney" { amount: n }))
+  for_ (join fibers) joinFiber
+  row <- rt.dashboard.read ada
+  assertEqual "every deposit on both streams reached the row"
+    (Just { accounts: 2, balance: 2 * (20 * 21 / 2) }) row
+  rt.stop
+
 policy :: Aff Unit
 policy = do
   rt <- start bank testOptions
@@ -133,8 +210,7 @@ policy = do
     =<< rt.customer.send (commandId "register") ada (cmd @"registerCustomer" { name: "ada" })
   assertEqual "the customer is registered once" 1 (length registered.events)
   provisioned <- rt.summary.read (mainAccount ada)
-  assertEqual "the policy opens the main account" (Just { owner: Just "ada", balance: 0 })
-    provisioned
+  assertEqual "the policy opens the main account" (Just { owner: Just ada, balance: 0 }) provisioned
 
   retried <- expectRight "retry register"
     =<< rt.customer.send (commandId "register") ada (cmd @"registerCustomer" { name: "ada" })

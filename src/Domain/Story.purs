@@ -2,7 +2,7 @@
 -- |
 -- | ```purescript
 -- | story account
--- |   [ given @"accountOpened" { owner: "sam" }
+-- |   [ given @"accountOpened" { owner: CustomerId "sam" }
 -- |   , command @"depositMoney" { amount: 100 }
 -- |   , emits @"moneyDeposited" { amount: 100, balanceAfter: 100 }
 -- |   , replies { balance: 100 }

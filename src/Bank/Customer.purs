@@ -2,6 +2,8 @@ module Bank.Customer (CustomerId(..), CustomerState(..), Customer, customer) whe
 
 import Prelude
 
+import Data.Argonaut.Decode (class DecodeJson)
+import Data.Argonaut.Encode (class EncodeJson)
 import Data.Generic.Rep (class Generic)
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
@@ -14,6 +16,8 @@ derive instance Newtype CustomerId _
 derive newtype instance Eq CustomerId
 derive newtype instance Ord CustomerId
 derive newtype instance Show CustomerId
+derive newtype instance EncodeJson CustomerId
+derive newtype instance DecodeJson CustomerId
 
 data CustomerState = Unregistered | Registered { name :: String }
 

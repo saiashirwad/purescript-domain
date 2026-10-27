@@ -3,10 +3,11 @@
 -- |
 -- | - `POST /<aggregate>/<id>/<command>` with an `Idempotency-Key` header
 -- |   sends the command. 200 returns the receipt, 409 the rejection.
--- | - `GET /<view>/<id>[?atLeast=<version>]` reads the view.
+-- | - `GET /<view>/<key>` reads the view's row.
 -- |
 -- | The only hand-written input is `guards`: one `principal -> id ->
--- | Boolean` per aggregate and view label.
+-- | Boolean` per aggregate label, and one `principal -> key -> Boolean` per
+-- | view label.
 module Domain.Http (Method(..), Request, Response, serve, class Routes, routes) where
 
 import Prelude
@@ -16,7 +17,6 @@ import Data.Argonaut.Encode (class EncodeJson, encodeJson)
 import Data.Array (uncons)
 import Data.Array as Array
 import Data.Either (Either(..))
-import Data.Int as Int
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), maybe)
@@ -24,17 +24,7 @@ import Data.Newtype (class Newtype, wrap)
 import Data.String (Pattern(..), split)
 import Data.Symbol (class IsSymbol, reflectSymbol)
 import Domain
-  ( class Spec
-  , Aggregate
-  , Command
-  , Event
-  , Policy
-  , Rejection
-  , View
-  , parseCommandId
-  , parseVersion
-  , versionNumber
-  )
+  (class Spec, Aggregate, Command, Event, Policy, Rejection, View, parseCommandId, versionNumber)
 import Domain.Codec (class DecodeCases, class EncodeCases, decode, encode, labelled, tagged)
 import Domain.Labels (class Field)
 import Domain.Runtime (AggregateHandle, ViewHandle)
@@ -138,31 +128,25 @@ commandRoute guard handle =
   }
 
 viewRoute ::
-  forall id v principal.
-  Newtype id String =>
+  forall k v principal.
+  Newtype k String =>
   EncodeJson v =>
-  (principal -> id -> Boolean) ->
-  ViewHandle id v ->
+  (principal -> k -> Boolean) ->
+  ViewHandle k v ->
   Route principal
 viewRoute guard handle =
   { method: GET
-  , handle: \principal rawId rest request -> do
+  , handle: \principal rawKey rest request -> do
       let
-        id = wrap rawId
-      if not (guard principal id)
+        key = wrap rawKey
+      if not (guard principal key)
       then pure forbidden
       else if rest /= []
       then pure (failure 404 ("no route for " <> request.path))
-      else case Map.lookup "atLeast" request.query of
-        Nothing -> found <$> handle.read id
-        Just raw -> case Int.fromString raw >>= parseVersion of
-          Nothing -> pure (failure 400 ("invalid atLeast version: " <> raw))
-          Just version ->
-            maybe (failure 408 "the view did not catch up") ok <$> handle.readAt version id
+      else maybe (failure 404 "nothing recorded for this key") ok <$> handle.read key
   }
   where
-  found = maybe (failure 404 "nothing recorded for this id") ok
-  ok state = { status: 200, body: encodeJson state }
+  ok row = { status: 200, body: encodeJson row }
 
 -- | One route per aggregate and view label. A missing guard is a compile
 -- | error naming the label.
@@ -198,15 +182,14 @@ instance ( IsSymbol l
     )
     (routes (Proxy :: Proxy t) guards rt)
 else instance ( IsSymbol l
-              , Spec spec id s c e r b
-              , Newtype id String
+              , Newtype k String
               , EncodeJson v
               , RowToList guards grl
-              , Field "serve needs a guard for " l grl (principal -> id -> Boolean)
-              , Row.Cons l (ViewHandle id v) rtTail rt
+              , Field "serve needs a guard for " l grl (principal -> k -> Boolean)
+              , Row.Cons l (ViewHandle k v) rtTail rt
               , Routes t guards rt principal
               ) =>
-  Routes (Cons l (View spec v) t) guards rt principal where
+  Routes (Cons l (View spec k v) t) guards rt principal where
   routes _ guards rt = Object.insert (reflectSymbol (Proxy :: Proxy l))
     ( viewRoute (unsafeGet (reflectSymbol (Proxy :: Proxy l)) guards)
         (Record.get (Proxy :: Proxy l) rt)
